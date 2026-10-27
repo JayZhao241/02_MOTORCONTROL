@@ -1,3 +1,13 @@
+/**
+ * @file motor.c
+ * @author 赵英杰
+ * @brief 控制电机角度、速度、状态和回零
+ * @version 0.1
+ * @date 2026-10-27
+ * 
+ * @copyright Copyright (c) 2026
+ * 
+ */
 #include "motor.h"
 #include "main.h"
 #include "stm32f4xx_hal.h"

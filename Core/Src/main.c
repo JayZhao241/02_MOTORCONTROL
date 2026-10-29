@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
+#include "rs485.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -95,6 +96,10 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_Base_Start_IT(&htim6); // 启动定时器中断
+  if (RS485_Init() != RS485_OK)
+  {
+      Error_Handler();
+  }
 
   /* USER CODE END 2 */
 

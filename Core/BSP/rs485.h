@@ -1,11 +1,12 @@
 #ifndef BSP_RS485_H
 #define BSP_RS485_H
 
+#include "main.h"
 #include <stdint.h>
 #include <stdbool.h>
 
 /**
- * @brief RX485操作结果
+ * @brief RX485驱动操作结果
  * 
  */
 typedef enum{
@@ -15,7 +16,7 @@ typedef enum{
     RS485_INVALID_PARAM,
     RS485_TIMEOUT,
     RS485_RX_OVERFLOW,
-    RS485_HW_ERROR,
+    RS485_HW_ERROR
 }RS485_Result_t;
 
 /* 初始化RS485驱动 */

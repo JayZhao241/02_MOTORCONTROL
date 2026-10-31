@@ -109,6 +109,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    RS485_Proc();
     KEY_Proc();
   }
   /* USER CODE END 3 */

@@ -16,7 +16,7 @@
 #include "stm32f4xx_hal_gpio.h"
 #include "stm32f4xx_hal_uart.h"
 #include "usart.h"
-#include <cstddef>
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -326,6 +326,7 @@ RS485_Result_t RS485_SendAsync(
         HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, GPIO_PIN_RESET);
 
         if (hal_status==HAL_BUSY) {
+             s_state = RS485_STATE_READY;
             return RS485_BUSY;
         }
 

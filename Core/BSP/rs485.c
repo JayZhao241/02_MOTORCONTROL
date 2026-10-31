@@ -54,6 +54,7 @@ static volatile uint16_t s_rx_tail = 0U; // 软件接收队列中，下一个读
 static volatile bool s_rx_overflow = false; // 接收队列溢出标志
 
 static volatile uint32_t s_tx_start_tick = 0U; // 记录发送超时的变量
+static volatile bool s_tx_abort_failed = false; 
 
 /** ============================================================================
  * @brief 判断接收数据暂存情况
@@ -373,6 +374,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     s_state=RS485_STATE_FAULT;
 }
 
+/** ============================================================================
+ * @brief 终止UART发送
+ * 
+ * ========================================================================== */
 void RS485_Proc(){
     if (s_state!=RS485_STATE_TX_ACTIVE) {
         return;
@@ -380,7 +385,59 @@ void RS485_Proc(){
 
     uint32_t elapsed = HAL_GetTick() - s_tx_start_tick;
 
-    if (elapsed>=RS485_TX_TIMEOUT_MS) {
-        s_state=RS485_STATE_FAULT;
+    if (elapsed < RS485_TX_TIMEOUT_MS)
+    {
+        return;
     }
+
+    // 3. 进入临界区
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    // 再次确认发送是否仍然进行
+    bool need_abort =
+        (s_state == RS485_STATE_TX_ACTIVE);
+
+    if (need_abort)
+    {
+        // 先锁定FAULT，避免后续完成回调恢复READY
+        s_state = RS485_STATE_FAULT;
+    }
+
+    // 4. 恢复中断状态
+    __set_PRIMASK(primask);
+
+    // 5. 如果发送已经结束，就不需要终止DMA
+    if (!need_abort)
+    {
+        return;
+    }
+    // 6. 终止USART2发送
+    HAL_StatusTypeDef hal_status =
+        HAL_UART_AbortTransmit(&huart2);
+
+    // 7. 无论终止是否成功，先释放RS485发送方向
+     HAL_GPIO_WritePin(
+        RS485_EN_GPIO_Port,
+        RS485_EN_Pin,
+        GPIO_PIN_RESET
+    );
+
+    // 8. 记录硬件终止失败
+    if (hal_status != HAL_OK)
+    {
+        s_tx_abort_failed = true;
+    }
+
+    // 保持RS485_STATE_FAULT，不自动恢复READY
+}
+
+bool RS485_IsTxBusy(void)
+{
+    // 判断s_state是否等于RS485_STATE_TX_ACTIVE
+    // 返回判断结果
+    if (s_state==RS485_STATE_TX_ACTIVE) {
+        return true;
+    }
+    return false;
 }

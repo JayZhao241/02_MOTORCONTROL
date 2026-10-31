@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "dma.h"
-#include "rs485.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"

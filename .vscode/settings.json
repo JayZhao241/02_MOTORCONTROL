@@ -1,4 +1,6 @@
 {
+    "doxdocgen.c.firstLine": "/** ============================================================================",
+    "doxdocgen.c.lastLine": " * ========================================================================== */",
     "doxdocgen.generic.authorEmail": "muyang2410@163.com",
     "doxdocgen.generic.useGitUserEmail": false,
     "cmake.cmakePath": "cube-cmake",

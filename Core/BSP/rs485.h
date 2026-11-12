@@ -1,7 +1,6 @@
 #ifndef BSP_RS485_H
 #define BSP_RS485_H
 
-#include "main.h"
 #include <stdint.h>
 #include <stdbool.h>
 

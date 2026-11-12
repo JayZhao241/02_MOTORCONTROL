@@ -9,6 +9,7 @@
  * 
  * ========================================================================== */
 
+#include "main.h"
 #include "rs485.h"
 #include "stm32f407xx.h"
 #include "stm32f4xx_hal.h"
@@ -45,7 +46,7 @@ typedef enum{
     RS485_STATE_FAULT
 } RS485_State_t;
 
-static RS485_State_t s_state = RS485_STATE_UNINIT; // 定义驱动状态
+static volatile RS485_State_t s_state = RS485_STATE_UNINIT; // 定义驱动状态
 
 static uint16_t s_dma_last_pos = 0U; // 上一次缓冲区读取到的位置
 static volatile uint16_t s_rx_head = 0U; // 软件接收队列中，下一个写入位置。

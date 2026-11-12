@@ -22,6 +22,7 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
+#include "zdt_x42s.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +47,13 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+
+static volatile ZDT_VersionState_t s_dbg_state =
+    ZDT_VERSION_IDLE;
+
+static ZDT_X42S_Version_t s_dbg_version = {0};
+
+static volatile bool s_dbg_version_ok = false;
 
 /* USER CODE END PV */
 
@@ -100,6 +108,14 @@ int main(void)
       Error_Handler();
   }
 
+  /* 首次查询前等待 10 ms，让串口和 RS485 接口稳定。 */
+  HAL_Delay(10U);
+
+  if (ZDT_X42S_StartVersionQuery(0x01U) != RS485_OK)
+  {
+      Error_Handler();
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -111,6 +127,16 @@ int main(void)
     /* USER CODE BEGIN 3 */
     RS485_Proc();
     KEY_Proc();
+    ZDT_X42S_Proc();
+
+    s_dbg_state = ZDT_X42S_GetVersionState();
+
+    if ((s_dbg_state == ZDT_VERSION_SUCCESS) &&
+        (!s_dbg_version_ok))
+    {
+        s_dbg_version_ok =
+            ZDT_X42S_GetVersion(&s_dbg_version);
+    }
   }
   /* USER CODE END 3 */
 }

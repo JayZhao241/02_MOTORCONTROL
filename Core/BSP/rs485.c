@@ -1,494 +1,255 @@
-/** ============================================================================
- * @file rs485.c
- * @author 赵英杰 (muyang2410@163.com)
- * @brief 
- * @version 0.1
- * @date 2026-10-29
- * 
- * @copyright Copyright (c) 2026
- * 
- * ========================================================================== */
-
-#include "main.h"
 #include "rs485.h"
-#include "stm32f407xx.h"
-#include "stm32f4xx_hal.h"
-#include "stm32f4xx_hal_def.h"
-#include "stm32f4xx_hal_gpio.h"
-#include "stm32f4xx_hal_uart.h"
+#include "main.h"
 #include "usart.h"
 #include <stddef.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <string.h>
 
-/** ============================================================================
- * @brief 静态变量区域
- * 
- * ========================================================================== */
-#define RS485_DMA_RX_SIZE  128U // DMA接收缓存区容量
-#define RS485_RX_QUEUE_SIZE 256U // 
-#define RS485_TX_BUF_SIZE  128U
-#define RS485_TX_TIMEOUT_MS 30U //发送超时时间
+#define RS485_DMA_RX_SIZE   128U
+#define RS485_RX_QUEUE_SIZE 256U
+#define RS485_TX_BUF_SIZE   128U
+#define RS485_TX_TIMEOUT_MS 30U
 
-/** ============================================================================
- * @brief 变量区域
- * 
- * ========================================================================== */
-static uint8_t s_dma_rx_buffer[RS485_DMA_RX_SIZE]; // DMA接收到的数据保存地址
-static uint8_t s_rx_queue[RS485_RX_QUEUE_SIZE]; // 保存等待处理的接收数据
-static uint8_t s_tx_buffer[RS485_TX_BUF_SIZE]; // 保存需要发送出去的字节
+static volatile uint8_t s_dma_rx_buffer[RS485_DMA_RX_SIZE];
+static uint8_t s_rx_queue[RS485_RX_QUEUE_SIZE];
+static uint8_t s_tx_buffer[RS485_TX_BUF_SIZE];
+static uint16_t s_dma_last_pos;
+static volatile uint16_t s_rx_head, s_rx_tail;
+static volatile bool s_rx_overflow, s_abort_pending;
+static volatile uint32_t s_tx_start_tick;
+static volatile RS485_Debug_t s_debug;
 
-typedef enum{
-    RS485_STATE_UNINIT = 0,
-    RS485_STATE_READY,
-    RS485_STATE_TX_ACTIVE,
-    RS485_STATE_FAULT
-} RS485_State_t;
-
-static volatile RS485_State_t s_state = RS485_STATE_UNINIT; // 定义驱动状态
-
-static uint16_t s_dma_last_pos = 0U; // 上一次缓冲区读取到的位置
-static volatile uint16_t s_rx_head = 0U; // 软件接收队列中，下一个写入位置。
-static volatile uint16_t s_rx_tail = 0U; // 软件接收队列中，下一个读取位置。
-
-static volatile bool s_rx_overflow = false; // 接收队列溢出标志
-
-static volatile uint32_t s_tx_start_tick = 0U; // 记录发送超时的变量
-static volatile bool s_tx_abort_failed = false; 
-
-/** ============================================================================
- * @brief 判断接收数据暂存情况
- * 
- * @param data 
- * @return true 
- * @return false 
- * ========================================================================== */
-static bool RS485_RxPushByte(uint8_t data)
+static uint32_t Lock(void)
 {
-    // 1. 计算下一个写入位置next_head
-    uint16_t next_head=(s_rx_head+1U) % RS485_RX_QUEUE_SIZE;
-
-    // 2. 判断队列是否已满
-    //    已满则返回false
-    if (next_head==s_rx_tail) {
-        return false;
-    }
-
-    // 3. 将data写入s_rx_queue[s_rx_head]
-    s_rx_queue[s_rx_head]=data;
-
-    // 4. 更新s_rx_head
-    s_rx_head=next_head;
-
-    // 5. 返回true
-    return true;
-}
-
-
-/** ============================================================================
- * @brief 检查接收缓冲区是否溢出
- * 
- * @return true 溢出，丢弃尚未读取的数据
- * @return false 
- * ========================================================================== */
-static bool RS485_RxCheckAndClearOverflow(void)
-{
-    // 保存进入函数时的中断屏蔽状态
-    uint32_t primask = __get_PRIMASK();
-
-    // 临时屏蔽可屏蔽中断
+    uint32_t mask = __get_PRIMASK();
     __disable_irq();
-
-    bool overflow = s_rx_overflow;
-
-    if (overflow)
-    {
-        // 丢弃队列中尚未读取的数据
-        s_rx_tail = s_rx_head;
-
-        // 清除本次已经记录的溢出标志
-        s_rx_overflow = false;
-    }
-
-    // 恢复进入函数前的中断屏蔽状态
-    __set_PRIMASK(primask);
-
-    return overflow;
+    return mask;
 }
 
-
-/** ============================================================================
- * @brief 驱动初始化函数
- * 
- * @return RS485_Result_t 
- * ========================================================================== */
-RS485_Result_t RS485_Init(void)
+static void Direction(bool tx)
 {
-    HAL_StatusTypeDef hal_status;
-
-    // 1. 检查s_state，避免重复初始化
-    switch (s_state) {
-        case RS485_STATE_UNINIT:
-            break;
-        case RS485_STATE_READY:
-            return RS485_OK;
-        case RS485_STATE_TX_ACTIVE:
-            return RS485_BUSY;
-        case RS485_STATE_FAULT:
-        default:
-            return RS485_HW_ERROR;
-    }
-
-    // 2. 将s_dma_last_pos、s_rx_head、s_rx_tail复位
-    s_dma_last_pos = 0U;
-    s_rx_head = 0U;
-    s_rx_tail = 0U;
-
-    // 3. 如果后续有其他接收错误标志，一并复位
-    s_rx_overflow=false;
-
-    // 4. PG8输出低电平，进入RS485接收模式
-    HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, GPIO_PIN_RESET);
-
-    // 5. 调用HAL_UARTEx_ReceiveToIdle_DMA()
-    //    将函数返回值保存到hal_status
-    hal_status = HAL_UARTEx_ReceiveToIdle_DMA(&huart2, s_dma_rx_buffer, RS485_DMA_RX_SIZE);
-
-    // 6. 根据hal_status判断初始化是否成功
-    switch (hal_status) {
-        case HAL_OK:
-            s_state = RS485_STATE_READY;
-            return RS485_OK;
-        case HAL_TIMEOUT:
-            s_state = RS485_STATE_FAULT;
-            return RS485_TIMEOUT;
-        case HAL_BUSY:
-            s_state = RS485_STATE_FAULT;
-            return RS485_BUSY;
-        case HAL_ERROR:
-        default:
-            s_state = RS485_STATE_FAULT;
-            return RS485_HW_ERROR;
-    }
-
-    // 7. 成功后设置s_state为READY，返回RS485_OK
-    //    失败则设置FAULT，并返回对应错误
+    HAL_GPIO_WritePin(RS485_EN_GPIO_Port, RS485_EN_Pin,
+                      tx ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-/** ============================================================================
- * @brief 回调函数、处理dma数据
- * 
- * @param huart 
- * @param Size 
- * ========================================================================== */
-void HAL_UARTEx_RxEventCallback(
-    UART_HandleTypeDef *huart,
-    uint16_t Size
-)
+static RS485_Result_t Record(RS485_Result_t result)
 {
-    if (huart != &huart2 ||
-        Size == 0U ||
-        Size > RS485_DMA_RX_SIZE)
-    {
-        return;
-    }
-
-    if (Size > s_dma_last_pos)
-    {
-        // 情况1：处理未回绕的数据
-        for (uint16_t i= s_dma_last_pos; i<Size; i++) {
-            uint8_t data = s_dma_rx_buffer[i];
-
-            if (RS485_RxPushByte(data) == false)
-            {
-                s_rx_overflow = true;
-            }
-        }
-    }
-    else if (Size < s_dma_last_pos)
-    {
-        // 情况2：处理缓冲区末尾和开头的数据
-        for (uint16_t i = s_dma_last_pos; i<RS485_DMA_RX_SIZE; i++) {
-            uint8_t data = s_dma_rx_buffer[i];
-            if (RS485_RxPushByte(data) == false)
-            {
-                s_rx_overflow = true;
-            }
-        }
-        for (uint16_t i = 0; i<Size; i++) {
-            uint8_t data = s_dma_rx_buffer[i];
-            if (RS485_RxPushByte(data) == false)
-            {
-                s_rx_overflow = true;
-            }
-        }
-    }
-    else
-    {
-        // 情况3：当前位置没有变化
-        return;
-    }
-
-    // 数据成功处理后，更新s_dma_last_pos
-    s_dma_last_pos = Size;
-}
-
-/** ============================================================================
- * @brief 主程序从接收队列取出电机回复数据
- * 
- * @param buffer 存放读出数据的数组
- * @param capacity 可以存放数据的大小
- * @param received 实际上读取了多少数据
- * @return RS485_Result_t 
- * ========================================================================== */
-RS485_Result_t RS485_Read(
-    uint8_t *buffer,
-    uint16_t capacity,
-    uint16_t *received
-)
-{
-    if (buffer==NULL || received == NULL ||capacity==0U) {
-        return RS485_INVALID_PARAM;
-    }
-
-    *received = 0U;
-
-    switch (s_state) {
-        case RS485_STATE_READY:
-        case RS485_STATE_TX_ACTIVE:
-            break;
-
-        case RS485_STATE_UNINIT:
-            return RS485_NOT_READY;
-
-        case RS485_STATE_FAULT:
-        default:
-            return RS485_HW_ERROR;
-    }
-
-    // 检查数据是否溢出
-    if (RS485_RxCheckAndClearOverflow())
-    {
-        return RS485_RX_OVERFLOW;
-    }
-
-    while ((*received < capacity)&&(s_rx_tail!=s_rx_head)) {
-        buffer[*received]=s_rx_queue[s_rx_tail];
-        s_rx_tail = (s_rx_tail + 1U) % RS485_RX_QUEUE_SIZE;
-        (*received)++;
-    }
-    if (RS485_RxCheckAndClearOverflow())
-    {
-        *received = 0U;
-        return RS485_RX_OVERFLOW;
-    }
-
-    return RS485_OK;
-}
-
-/** ============================================================================
- * @brief 向电机发送指令
- * 
- * @param data 
- * @param length 
- * @return RS485_Result_t 
- * ========================================================================== */
-RS485_Result_t RS485_SendAsync(
-    const uint8_t *data,
-    uint16_t length
-)
-{
-    if (data==NULL||length==0U||length>RS485_TX_BUF_SIZE) {
-        return RS485_INVALID_PARAM;
-    }
-
-    switch (s_state) {
-        case RS485_STATE_READY:
-            break;
-        case RS485_STATE_TX_ACTIVE:
-            return RS485_BUSY;
-
-        case RS485_STATE_UNINIT:
-            return RS485_NOT_READY;
-
-        case RS485_STATE_FAULT:
-        default:
-            return RS485_HW_ERROR;
-    }
-    memcpy(s_tx_buffer, data, length);
-
-    s_tx_start_tick=HAL_GetTick();
-    s_state=RS485_STATE_TX_ACTIVE;
-    HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, GPIO_PIN_SET);
-
-    
-    HAL_StatusTypeDef hal_status = HAL_UART_Transmit_DMA(&huart2, s_tx_buffer, length);
-    if (hal_status!=HAL_OK) {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, GPIO_PIN_RESET);
-
-        if (hal_status==HAL_BUSY) {
-             s_state = RS485_STATE_READY;
-            return RS485_BUSY;
-        }
-
-        s_state = RS485_STATE_FAULT;
-        if (hal_status==HAL_TIMEOUT) {
-            return RS485_TIMEOUT;
-        }
-
-        return RS485_HW_ERROR;
-    }
-
-    return RS485_OK;
-}
-
-/** ============================================================================
- * @brief 发送回调函数
- * 
- * @param huart 
- * ========================================================================== */
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart!=&huart2) {
-        return;
-    }
-
-    HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, GPIO_PIN_RESET);
-    if (s_state==RS485_STATE_TX_ACTIVE) {
-        s_state=RS485_STATE_READY;
-    }
-}
-
-/** ============================================================================
- * @brief UART错误回调函数
- * 
- * @param huart 
- * ========================================================================== */
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-    if (huart!=&huart2) {
-        return;
-    }
-
-    HAL_GPIO_WritePin(GPIOG, GPIO_PIN_8, GPIO_PIN_RESET);
-    s_state=RS485_STATE_FAULT;
-}
-
-/** ============================================================================
- * @brief 终止UART发送
- * 
- * ========================================================================== */
-void RS485_Proc(){
-    if (s_state!=RS485_STATE_TX_ACTIVE) {
-        return;
-    }
-
-    uint32_t elapsed = HAL_GetTick() - s_tx_start_tick;
-
-    if (elapsed < RS485_TX_TIMEOUT_MS)
-    {
-        return;
-    }
-
-    // 3. 进入临界区
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-
-    // 再次确认发送是否仍然进行
-    bool need_abort =
-        (s_state == RS485_STATE_TX_ACTIVE);
-
-    if (need_abort)
-    {
-        // 先锁定FAULT，避免后续完成回调恢复READY
-        s_state = RS485_STATE_FAULT;
-    }
-
-    // 4. 恢复中断状态
-    __set_PRIMASK(primask);
-
-    // 5. 如果发送已经结束，就不需要终止DMA
-    if (!need_abort)
-    {
-        return;
-    }
-    // 6. 终止USART2发送
-    HAL_StatusTypeDef hal_status =
-        HAL_UART_AbortTransmit(&huart2);
-
-    // 7. 无论终止是否成功，先释放RS485发送方向
-     HAL_GPIO_WritePin(
-        RS485_EN_GPIO_Port,
-        RS485_EN_Pin,
-        GPIO_PIN_RESET
-    );
-
-    // 8. 记录硬件终止失败
-    if (hal_status != HAL_OK)
-    {
-        s_tx_abort_failed = true;
-    }
-
-    // 保持RS485_STATE_FAULT，不自动恢复READY
-}
-
-bool RS485_IsTxBusy(void)
-{
-    // 判断s_state是否等于RS485_STATE_TX_ACTIVE
-    // 返回判断结果
-    if (s_state==RS485_STATE_TX_ACTIVE) {
-        return true;
-    }
-    return false;
-}
-
-
-/** ============================================================================
- * @brief 清除接收队列中未读取的字节
- * 
- * @return RS485_Result_t 
- * ========================================================================== */
-RS485_Result_t RS485_ClearRx(void)
-{
-    // 保存进入函数之前的中断状态
-    uint32_t primask = __get_PRIMASK();
-
-    // 进入临界区
-    __disable_irq();
-
-    RS485_Result_t result;
-
-    switch (s_state)
-    {
-        case RS485_STATE_READY:
-
-            // 将读取位置移动到写入位置
-            s_rx_tail = s_rx_head;
-
-            // 清除本次已丢弃数据对应的溢出标志
-            s_rx_overflow = false;
-
-            result = RS485_OK;
-            break;
-
-        case RS485_STATE_TX_ACTIVE:
-            result = RS485_BUSY;
-            break;
-
-        case RS485_STATE_UNINIT:
-            result = RS485_NOT_READY;
-            break;
-
-        case RS485_STATE_FAULT:
-        default:
-            result = RS485_HW_ERROR;
-            break;
-    }
-
-    // 恢复原来的中断状态
-    __set_PRIMASK(primask);
-
+    if (result != RS485_OK) { s_debug.last_error = result; }
     return result;
 }
 
+static RS485_Result_t CheckState(void)
+{
+    if (s_debug.state == RS485_STATE_UNINIT) { return RS485_NOT_READY; }
+    if (s_debug.state == RS485_STATE_FAULT) { return RS485_HW_ERROR; }
+    return RS485_OK;
+}
+
+static RS485_Result_t FromHal(HAL_StatusTypeDef status)
+{
+    switch (status) {
+    case HAL_OK: return RS485_OK;
+    case HAL_BUSY: return RS485_BUSY;
+    case HAL_TIMEOUT: return RS485_TIMEOUT;
+    default: return RS485_HW_ERROR;
+    }
+}
+
+RS485_Result_t RS485_Init(void)
+{
+    uint32_t mask = Lock();
+    RS485_Result_t result;
+    if (s_debug.state != RS485_STATE_UNINIT) {
+        result = s_debug.state == RS485_STATE_READY ? RS485_OK :
+                 s_debug.state == RS485_STATE_TX_ACTIVE ? RS485_BUSY : RS485_HW_ERROR;
+    } else {
+        s_dma_last_pos = 0U; /* Initial DMA start only. Never reset on queue clear. */
+        s_rx_head = s_rx_tail = 0U;
+        s_rx_overflow = false;
+        Direction(false);
+        s_debug.state = RS485_STATE_READY;
+        HAL_StatusTypeDef status = HAL_UARTEx_ReceiveToIdle_DMA(
+            &huart2, (uint8_t *)s_dma_rx_buffer, RS485_DMA_RX_SIZE);
+        s_debug.last_hal_status = status;
+        result = FromHal(status);
+        if (result != RS485_OK) {
+            s_debug.last_hal_error = huart2.ErrorCode;
+            s_debug.state = RS485_STATE_FAULT;
+        }
+    }
+    Record(result);
+    __set_PRIMASK(mask);
+    return result;
+}
+
+/* RX HT, TC and IDLE must remain enabled. RX DMA and USART2 IRQ have the same
+ * preemption priority (6), so these callbacks cannot nest each other.
+ * Read the live DMA cursor instead of a possibly stale HT/IDLE Size: an IDLE
+ * IRQ serviced before a pending HT IRQ must not replay old bytes as a wrap.
+ * CPU must service RX in < half-buffer time (~5.56 ms @ 115200 8N1).
+ * No cursor algorithm can recover bytes overwritten by an entire unseen lap. */
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    if (huart != &huart2 || Size == 0U || Size > RS485_DMA_RX_SIZE ||
+        CheckState() != RS485_OK || huart->hdmarx == NULL) { return; }
+    uint32_t remaining = __HAL_DMA_GET_COUNTER(huart->hdmarx);
+    if (remaining > RS485_DMA_RX_SIZE) { return; }
+    uint16_t pos = (uint16_t)((RS485_DMA_RX_SIZE - remaining) % RS485_DMA_RX_SIZE);
+    while (s_dma_last_pos != pos) {
+        uint8_t byte = s_dma_rx_buffer[s_dma_last_pos];
+        s_dma_last_pos = (uint16_t)((s_dma_last_pos + 1U) % RS485_DMA_RX_SIZE);
+        uint16_t next = (uint16_t)((s_rx_head + 1U) % RS485_RX_QUEUE_SIZE);
+        if (next == s_rx_tail) {
+            if (!s_rx_overflow) { s_debug.overflow_count++; }
+            s_rx_overflow = true;
+            s_debug.last_error = RS485_RX_OVERFLOW;
+        } else {
+            s_rx_queue[s_rx_head] = byte;
+            __DMB();
+            s_rx_head = next;
+        }
+        s_debug.rx_bytes++;
+    }
+}
+
+RS485_Result_t RS485_Read(uint8_t *buffer, uint16_t capacity, uint16_t *received)
+{
+    if (received != NULL) { *received = 0U; }
+    if (buffer == NULL || received == NULL || capacity == 0U) {
+        return Record(RS485_INVALID_PARAM);
+    }
+    RS485_Result_t result = CheckState();
+    if (result != RS485_OK) { return Record(result); }
+    /* Single main-loop consumer; producer publishes bytes before head. */
+    uint32_t mask = Lock();
+    if (s_rx_overflow) {
+        s_rx_tail = s_rx_head;
+        s_rx_overflow = false;
+        result = RS485_RX_OVERFLOW;
+    }
+    __set_PRIMASK(mask);
+    if (result != RS485_OK) { return Record(result); }
+    while (*received < capacity && s_rx_tail != s_rx_head) {
+        buffer[*received] = s_rx_queue[s_rx_tail];
+        __DMB();
+        s_rx_tail = (uint16_t)((s_rx_tail + 1U) % RS485_RX_QUEUE_SIZE);
+        (*received)++;
+    }
+    mask = Lock();
+    if (s_rx_overflow || CheckState() != RS485_OK) {
+        result = s_rx_overflow ? RS485_RX_OVERFLOW : RS485_HW_ERROR;
+        s_rx_tail = s_rx_head;
+        s_rx_overflow = false;
+        *received = 0U; /* Caller must ignore the partial copy. */
+    }
+    Record(result);
+    __set_PRIMASK(mask);
+    return result;
+}
+
+RS485_Result_t RS485_ClearRx(void)
+{
+    uint32_t mask = Lock();
+    RS485_Result_t result = CheckState();
+    if (result == RS485_OK && s_debug.state == RS485_STATE_TX_ACTIVE) {
+        result = RS485_BUSY;
+    }
+    if (result == RS485_OK) {
+        s_rx_tail = s_rx_head;
+        s_rx_overflow = false;
+    }
+    Record(result);
+    __set_PRIMASK(mask);
+    return result;
+}
+
+RS485_Result_t RS485_SendAsync(const uint8_t *data, uint16_t length)
+{
+    uint32_t mask = Lock();
+    RS485_Result_t result = CheckState();
+    if (data == NULL || length == 0U || length > RS485_TX_BUF_SIZE) {
+        result = RS485_INVALID_PARAM;
+    } else if (result == RS485_OK && s_debug.state == RS485_STATE_TX_ACTIVE) {
+        result = RS485_BUSY;
+    }
+    if (result == RS485_OK) {
+        memcpy(s_tx_buffer, data, length);
+        s_tx_start_tick = HAL_GetTick();
+        s_debug.state = RS485_STATE_TX_ACTIVE;
+        s_debug.tx_completed = false;
+        Direction(true);
+        HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(&huart2, s_tx_buffer, length);
+        s_debug.last_hal_status = status;
+        result = FromHal(status);
+        s_debug.last_tx_result = result;
+        if (result != RS485_OK) {
+            Direction(false);
+            s_debug.state = status == HAL_BUSY ? RS485_STATE_READY : RS485_STATE_FAULT;
+            s_debug.last_hal_error = huart2.ErrorCode;
+        }
+    }
+    s_debug.last_tx_start_result = result;
+    Record(result);
+    __set_PRIMASK(mask);
+    return result;
+}
+
+/* With TX DMA Normal mode HAL calls this from UART TC, after the last stop bit,
+ * not from DMA transfer completion. A late callback cannot clear a latched fault. */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart != &huart2) { return; }
+    Direction(false);
+    if (s_debug.state == RS485_STATE_TX_ACTIVE) {
+        s_debug.tx_completed = true;
+        s_debug.last_tx_result = RS485_OK;
+        s_debug.state = RS485_STATE_READY;
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart != &huart2) { return; }
+    s_debug.last_hal_error = huart->ErrorCode;
+    s_debug.last_error = RS485_HW_ERROR;
+    if (s_debug.state == RS485_STATE_TX_ACTIVE) {
+        s_debug.last_tx_result = RS485_HW_ERROR;
+        s_abort_pending = true;
+    }
+    s_debug.state = RS485_STATE_FAULT;
+    Direction(false);
+}
+
+void RS485_Proc(void)
+{
+    uint32_t mask = Lock();
+    if (s_debug.state == RS485_STATE_TX_ACTIVE &&
+        (uint32_t)(HAL_GetTick() - s_tx_start_tick) >= RS485_TX_TIMEOUT_MS) {
+        s_debug.state = RS485_STATE_FAULT;
+        s_debug.last_error = RS485_TIMEOUT;
+        s_debug.last_tx_result = RS485_TIMEOUT;
+        s_abort_pending = true;
+        Direction(false);
+    }
+    bool abort_tx = s_abort_pending;
+    s_abort_pending = false;
+    __set_PRIMASK(mask);
+    if (abort_tx) {
+        /* Asynchronous abort: never restart RX DMA or restore READY here. */
+        HAL_StatusTypeDef status = HAL_UART_AbortTransmit_IT(&huart2);
+        s_debug.last_hal_status = status;
+        if (status != HAL_OK) { s_debug.tx_abort_failed = true; }
+    }
+}
+
+bool RS485_IsTxBusy(void) { return s_debug.state == RS485_STATE_TX_ACTIVE; }
+
+bool RS485_GetDebug(RS485_Debug_t *out)
+{
+    if (out == NULL) { return false; }
+    uint32_t mask = Lock();
+    *out = s_debug;
+    out->queued_bytes = (uint16_t)((s_rx_head + RS485_RX_QUEUE_SIZE - s_rx_tail)
+                                  % RS485_RX_QUEUE_SIZE);
+    __set_PRIMASK(mask);
+    return true;
+}

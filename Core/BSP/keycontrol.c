@@ -1,10 +1,12 @@
 #include "keycontrol.h"
+#include "para.h"
+#include "motor.h"
 #include <stdint.h>
 #include "main.h"
 #include "stm32f407xx.h"
 #include "stm32f4xx_hal_gpio.h"
 
-void KEY_Time()
+void KEY_Time(void)
 {
     KEY[0].state=HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_4);
     KEY[1].state=HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_3);
@@ -34,7 +36,7 @@ void KEY_Time()
     }
 }
 
-void KEY_Proc()
+void KEY_Proc(void)
 {
     if (KEY[0].press==1) {
         MOTOR_Control(9, 0);

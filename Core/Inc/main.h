@@ -32,11 +32,6 @@ extern "C" {
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
-#include "para.h"
-#include "keycontrol.h"
-#include "motor.h"
-#include "rs485.h"
-#include "zdt_x42s.h"
 
 /* USER CODE END Includes */
 

@@ -1,9 +1,7 @@
 #ifndef BSP_KEYCONTROL_H
 #define BSP_KEYCONTROL_H
 
-#include "main.h"
-
-void KEY_Time();
-void KEY_Proc();
+void KEY_Time(void);
+void KEY_Proc(void);
 
 #endif /* BSP_KEYCONTROL_H */

@@ -36,4 +36,6 @@ bool RS485_IsTxBusy(void);
 /* 驱动状态机处理 */
 void RS485_Proc(void);
 
+RS485_Result_t RS485_ClearRx(void);
+
 #endif /* BSP_RS485_H */

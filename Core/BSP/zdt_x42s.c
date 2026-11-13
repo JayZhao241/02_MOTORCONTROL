@@ -15,6 +15,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "stm32f4xx_hal.h"
+#include <string.h>
 
 /** ============================================================================
  * @brief 静态变量区域
@@ -22,6 +23,7 @@
  * ========================================================================== */
 #define ZDT_VERSION_FRAME_LEN   7U
 #define ZDT_VERSION_TIMEOUT_MS  100U
+#define ZDT_PROC_MAX_BYTES 16U
 
 
 /** ============================================================================
@@ -149,63 +151,110 @@ RS485_Result_t ZDT_X42S_RequestVersion(
  * @param motor_addr 
  * @return RS485_Result_t 
  * ========================================================================== */
+
 RS485_Result_t ZDT_X42S_StartVersionQuery(
     uint8_t motor_addr
 )
 {
-    if (s_query.state==ZDT_VERSION_WAIT_RESPONSE) {
+    // 1. 已有查询进行中，不允许启动新查询
+    if (s_query.state == ZDT_VERSION_WAIT_RESPONSE)
+    {
         return RS485_BUSY;
     }
 
-    RS485_Result_t result = ZDT_X42S_RequestVersion(motor_addr);
+    // 2. 清空软件接收队列中已经入队的旧字节
+    RS485_Result_t clear_result = RS485_ClearRx();
 
-    if (result!=RS485_OK) {
-        s_query.comm_result=result;
-        s_query.state=ZDT_VERSION_ERROR;
-        return result;
+    if (clear_result != RS485_OK)
+    {
+        s_query.comm_result = clear_result;
+        s_query.state = ZDT_VERSION_ERROR;
+        return clear_result;
     }
 
-    s_query.motor_addr = motor_addr;
-
-    s_query.rx_len = 0U;
-
-    s_query.start_tick = HAL_GetTick();
-
-    s_query.comm_result = RS485_OK;
-
-    s_query.state = ZDT_VERSION_WAIT_RESPONSE;
-
-    return RS485_OK;
-}
-
-/** ============================================================================
- * @brief 处理接收和超时
- * 
- * ========================================================================== */
-void ZDT_X42S_Proc(void)
-{
-    if (s_query.state!=ZDT_VERSION_WAIT_RESPONSE) {
-        return;
-    }
-    uint16_t count = 0U;
-
-    RS485_Result_t result = RS485_Read(
-        &s_query.rx_buf[s_query.rx_len],
-        (uint16_t)(sizeof(s_query.rx_buf) - s_query.rx_len),
-        &count
-    );
+    // 3. 发送版本查询命令
+    RS485_Result_t result =
+        ZDT_X42S_RequestVersion(motor_addr);
 
     if (result != RS485_OK)
     {
         s_query.comm_result = result;
         s_query.state = ZDT_VERSION_ERROR;
+        return result;
+    }
+
+    // 4. 记录本次查询
+    s_query.motor_addr = motor_addr;
+    s_query.rx_len = 0U;
+    s_query.start_tick = HAL_GetTick();
+    s_query.comm_result = RS485_OK;
+
+    // 5. 进入等待状态
+    s_query.state = ZDT_VERSION_WAIT_RESPONSE;
+
+    return RS485_OK;
+}
+
+
+/** ============================================================================
+ * @brief 处理接收和超时
+ * 
+ * ========================================================================== */
+
+void ZDT_X42S_Proc(void)
+{
+    // 1. 不在等待状态，直接返回
+    if (s_query.state != ZDT_VERSION_WAIT_RESPONSE)
+    {
         return;
     }
 
-    s_query.rx_len += count;
-
-    if (s_query.rx_len == ZDT_VERSION_FRAME_LEN)
+    // 2. 首先检查本次查询是否已经超时
+    if ((uint32_t)(HAL_GetTick() - s_query.start_tick)
+        >= ZDT_VERSION_TIMEOUT_MS)
     {
+        s_query.comm_result = RS485_TIMEOUT;
+        s_query.state = ZDT_VERSION_TIMEOUT;
+        return;
+    }
+
+    // 3. 每次调用最多处理16个接收字节
+    for (uint8_t i = 0U; i < ZDT_PROC_MAX_BYTES; i++)
+    {
+        uint8_t byte = 0U;
+        uint16_t count = 0U;
+
+        RS485_Result_t result = RS485_Read(
+            &byte,
+            1U,
+            &count
+        );
+
+        // 4. 底层读取异常
+        if (result != RS485_OK)
+        {
+            s_query.comm_result = result;
+            s_query.state = ZDT_VERSION_ERROR;
+            return;
+        }
+
+        // 5. 暂时没有新数据
+        if (count == 0U)
+        {
+            break;
+        }
+
+        // 6. 把新字节追加到窗口中
+        s_query.rx_buf[s_query.rx_len] = byte;
+        s_query.rx_len++;
+
+        // 7. 尚未收满7字节
+        if (s_query.rx_len < ZDT_VERSION_FRAME_LEN)
+        {
+            continue;
+        }
+
+        // 8. 收满7字节，检查是否为正确回复
         bool ok = ZDT_X42S_ParseVersion(
             s_query.rx_buf,
             s_query.rx_len,
@@ -216,21 +265,29 @@ void ZDT_X42S_Proc(void)
         if (ok)
         {
             s_query.state = ZDT_VERSION_SUCCESS;
-        }
-        else
-        {
-            s_query.state = ZDT_VERSION_ERROR;
+            return;
         }
 
-        return;
+        // 9. 不是正确的回复，窗口左移一字节
+        memmove(
+            &s_query.rx_buf[0],
+            &s_query.rx_buf[1],
+            ZDT_VERSION_FRAME_LEN - 1U
+        );
+
+        // 10. 保留后面6个字节，等待下一个字节
+        s_query.rx_len = ZDT_VERSION_FRAME_LEN - 1U;
     }
-    if ((HAL_GetTick() - s_query.start_tick)
-    >= ZDT_VERSION_TIMEOUT_MS)
+
+    // 11. 本轮处理结束后，再检查一次超时
+    if ((uint32_t)(HAL_GetTick() - s_query.start_tick)
+        >= ZDT_VERSION_TIMEOUT_MS)
     {
         s_query.comm_result = RS485_TIMEOUT;
         s_query.state = ZDT_VERSION_TIMEOUT;
     }
 }
+
 
 /** ============================================================================
  * @brief 获取查询状态
@@ -240,6 +297,11 @@ void ZDT_X42S_Proc(void)
 ZDT_VersionState_t ZDT_X42S_GetVersionState(void)
 {
     return s_query.state;
+}
+
+RS485_Result_t ZDT_X42S_GetCommResult(void)
+{
+    return s_query.comm_result;
 }
 
 

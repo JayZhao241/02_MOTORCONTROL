@@ -55,6 +55,9 @@ static ZDT_X42S_Version_t s_dbg_version = {0};
 
 static volatile bool s_dbg_version_ok = false;
 
+/* Volatile keeps the communication result available in the debugger. */
+static volatile RS485_Result_t s_dbg_comm_result = RS485_OK;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -126,10 +129,11 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     RS485_Proc();
-    KEY_Proc();
+    // KEY_Proc();
     ZDT_X42S_Proc();
 
     s_dbg_state = ZDT_X42S_GetVersionState();
+    s_dbg_comm_result = ZDT_X42S_GetCommResult();
 
     if ((s_dbg_state == ZDT_VERSION_SUCCESS) &&
         (!s_dbg_version_ok))

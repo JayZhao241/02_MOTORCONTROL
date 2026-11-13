@@ -442,3 +442,53 @@ bool RS485_IsTxBusy(void)
     }
     return false;
 }
+
+
+/** ============================================================================
+ * @brief 清除接收队列中未读取的字节
+ * 
+ * @return RS485_Result_t 
+ * ========================================================================== */
+RS485_Result_t RS485_ClearRx(void)
+{
+    // 保存进入函数之前的中断状态
+    uint32_t primask = __get_PRIMASK();
+
+    // 进入临界区
+    __disable_irq();
+
+    RS485_Result_t result;
+
+    switch (s_state)
+    {
+        case RS485_STATE_READY:
+
+            // 将读取位置移动到写入位置
+            s_rx_tail = s_rx_head;
+
+            // 清除本次已丢弃数据对应的溢出标志
+            s_rx_overflow = false;
+
+            result = RS485_OK;
+            break;
+
+        case RS485_STATE_TX_ACTIVE:
+            result = RS485_BUSY;
+            break;
+
+        case RS485_STATE_UNINIT:
+            result = RS485_NOT_READY;
+            break;
+
+        case RS485_STATE_FAULT:
+        default:
+            result = RS485_HW_ERROR;
+            break;
+    }
+
+    // 恢复原来的中断状态
+    __set_PRIMASK(primask);
+
+    return result;
+}
+

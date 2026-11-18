@@ -23,7 +23,7 @@ static uint32_t Lock(void)
     uint32_t mask = __get_PRIMASK();
     __disable_irq();
     return mask;
-}
+ }
 
 static void Direction(bool tx)
 {

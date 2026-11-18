@@ -8,11 +8,13 @@ typedef struct { DMA_HandleTypeDef *hdmarx; uint32_t ErrorCode; } UART_HandleTyp
 #define GPIO_PIN_RESET 0
 #define __HAL_DMA_GET_COUNTER(dma) ((dma)->counter)
 uint32_t HAL_GetTick(void);
+void HAL_Delay(uint32_t milliseconds);
 uint32_t __get_PRIMASK(void);
 void __disable_irq(void);
 void __set_PRIMASK(uint32_t mask);
 #define __DMB() ((void)0)
 void HAL_GPIO_WritePin(int port, int pin, int level);
+int HAL_GPIO_ReadPin(int port, int pin);
 HAL_StatusTypeDef HAL_UARTEx_ReceiveToIdle_DMA(UART_HandleTypeDef *, uint8_t *, uint16_t);
 HAL_StatusTypeDef HAL_UART_Transmit_DMA(UART_HandleTypeDef *, uint8_t *, uint16_t);
 HAL_StatusTypeDef HAL_UART_AbortTransmit_IT(UART_HandleTypeDef *);

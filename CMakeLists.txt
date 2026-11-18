@@ -49,6 +49,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/BSP/motor.c
     Core/BSP/rs485.c
     Core/BSP/zdt_x42s.c
+    Core/BSP/emm_v5.c
+    Core/BSP/motor_app.c
     # Add user sources here
 )
 

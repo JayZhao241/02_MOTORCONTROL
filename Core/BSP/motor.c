@@ -11,11 +11,10 @@
 #include "motor.h"
 #include "main.h"
 #include "stm32f4xx_hal.h"
-#include "stm32f4xx_hal_gpio.h"
 #include <stdint.h>
 
 // 控制电机发送一个脉冲
-static void MOTOR_SendOnePulse()
+static void MOTOR_SendOnePulse(void)
 {
     HAL_GPIO_WritePin(MOTOR_STEP_GPIO_Port, MOTOR_STEP_Pin, GPIO_PIN_SET);
     HAL_Delay(2);
@@ -30,6 +29,11 @@ dir: 方向，0为顺时针，1为逆时针
 */
 void MOTOR_Control(float angle, uint8_t dir)
 {
+    /* Validate before converting to an unsigned pulse count. This comparison
+     * also rejects NaN and infinities, which cannot be converted safely. */
+    if (!(angle >= 0.0f && angle <= 360.0f) || dir > 1U) {
+        return;
+    }
     // 发送的脉冲数只能为整数
     float pulse_origin=(angle*3200.0f)/360.0f;
     uint32_t pulse_count = (uint32_t)(pulse_origin + 0.5f);

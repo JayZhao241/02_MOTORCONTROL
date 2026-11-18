@@ -1,181 +1,247 @@
-# 单电机通信与实机调试
+# Emm 单电机控制：当前实现与实机调试
 
-本次审查基线：GitHub main / 本地 HEAD `e1fc7cabdd7d3bc15ea496571bc5af705c988bd6`。
-用户确认实际电机为 **Emm 固件**。实际细分、步距角、限位有效电平、机械负载与应答配置尚未确认。
-协议依据厂商《ZDT_X42S 第二代闭环步进电机用户手册 V1.0.5_260527》：
-[公开手册副本](https://github.com/xhfb/emm_stepper/blob/main/ZDT_X42S第二代闭环步进电机用户手册V1.0.5_260527.pdf)。
-核对章节：4.1.2、5.3.12、5.5.2、5.5.13、5.5.15、5.6.4。
-位置命令仅实现 Emm；未实现 X 命令、广播、同步运动、自动使能、上电运动或自动重试。
+本说明对应本次依据用户提供 STM32F407 HAL/Emm 例程完成的重构。
+例程选择、对照结论和来源摘要见 [例程对照与重构说明](例程对照与重构说明.md)。
 
-## 文件与职责
+## 先使用哪些入口
 
-| 文件 | 本次修改 |
+烧录 `build/Debug/02_MOTORCONTROL.elf`，启动后等待至少500ms。
+上电不查询、不使能、不运动。物理按键按下并松开触发一次，长按不重复。
+
+| 操作 | 行为 |
 |---|---|
-| Core/BSP/rs485.c、rs485.h | 统一方向引脚宏；循环 DMA 实时游标搬运；队列清理；错误与发送结果快照；非阻塞发送终止 |
-| Core/BSP/zdt_x42s.c、zdt_x42s.h | 单事务、流解析、版本/状态/选项/位置查询、Emm 位置命令、运动证据、超时隔离 |
-| Core/Src/main.c | 单个 Watch 调试结构体、显式一次性请求；关闭按键业务；取消上电自动查询与等待 |
-| Core/Inc/main.h | 移除 BSP 聚合包含，打断循环依赖 |
-| Core/BSP/keycontrol.c、keycontrol.h、motor.h | 直接包含实际依赖、明确无参函数声明；保留按键与 STEP/DIR 实现 |
-| tests/test_communication.c、tests/stubs/*、tests/run.sh | 使用生产源码的主机侧 HAL 模拟、回归测试 |
-| 本文档 | 取代原先与当前实现不一致的说明 |
+| K1 / PE3 | 地址1、方向0、80输入脉冲、5RPM、加速度0、相对上一目标 |
+| K2 / PE2 | 地址1、方向1，其他参数相同 |
+| K0 / PE4 | 优先发送软件停止请求，取消本机待执行的准备流程 |
 
-CubeMX 初始化、USART/DMA 中断入口、GPIO 映射没有修改。PA2/PA3、115200 8N1、
-RX Stream5 Circular、TX Stream6 Normal、UART/DMA IRQ 同为抢占优先级 6，均已静态核对。
-`RS485_EN_GPIO_Port/Pin` 在 main.h 映射 PG8；高发送、低接收仍需实测确认。
+两个运动键同时触发忽略；K0优先于其他键和Watch运动请求。忙时按键不排队。
+80是**输入脉冲数**；仅在1.8°电机、16细分、一圈3200输入脉冲时约等于9°。
+实际MStep尚需确认，机械条件允许后再按键。
 
-## 核心流程
+按键参数在 `Core/Src/main.c` 的 USER CODE PD 中：
 
-1. main 只调用 RS485_Proc、ZDT_X42S_Proc、Debug_Proc；TIM6 按键采样保留。
-2. ZDT 检查事务占用、地址和恢复隔离状态，清理已入软件队列的旧数据，组帧并启动 DMA。
-3. RS485 复制发送数据到 128 字节内部缓冲区，拉高方向，异步发送。
-4. Normal DMA 完成后 HAL 开启 UART TC 中断；最后停止位结束时才调用 TxCplt，切回接收。
-5. RX DMA 使用 128 字节循环缓冲；HT/TC/IDLE 回调读取实时 NDTR，将新字节搬到 256 字节队列（可用255字节）。
-6. ZDT 每轮最多取32字节，按功能码和固定长度寻找完整帧，再匹配地址、当前功能及事务状态。
-7. 每次只有一个等待回复的事务。RS485_Read 只能由 ZDT_Proc 调用；应用读取快照/公开结果。
+```c
+#define APP_MOTOR_ADDRESS 1U
+#define APP_JOG_PULSES    80U
+#define APP_JOG_RPM       5U
+#define APP_JOG_ACCEL     0U
+#define APP_JOG_MODE      0U
+```
 
-DMA 回调使用实时写游标，避免延迟的 HT Size 在较晚 IDLE 之后被误当成回绕；重复游标不重复入队。
-HT/TC 中断必须保留，DMA 和 UART 回调不能互相抢占。连续满速接收时中断服务间隔应小于半缓冲时间
-（约5.56ms）；如果整圈数据在 CPU 处理前已被覆盖，单靠 NDTR 无法恢复或可靠检测丢失。
-软件队列溢出可以检测：返回 RX_OVERFLOW，丢弃本轮副本，并使协议进入恢复隔离。
+K0是通讯软件停止，不是硬件急停。暂停MCU调试不能让电机停止。
+FE确认仅表示电机接受停止请求，不能单独证明转子已经静止。
 
-`RS485_ClearRx()` 在临界区只把软件 tail 移到已发布的 head，并清除对应溢出标志。
-它不触碰 s_dma_last_pos，不停 DMA，不能清理尚未由回调搬运的字节，也不能消除将来的迟到回复。
-TX 中清理返回 BUSY。错误/超时锁定 FAULT，晚到的完成回调不能恢复 READY。
-硬件故障不提供自动重新初始化，检查原因后复位 MCU。
+## 单一所有者与分层
 
-## 帧与结果
-
-| 功能 | 请求 | 正常回复长度 |
-|---|---|---|
-| 版本 | Addr 1F 6B | 7：地址、1F、固件高低字节、硬件信息、硬件版本、6B |
-| 电机状态 | Addr 3A 6B | 4：地址、3A、状态位、6B |
-| 选项 | Addr 1A 6B | 4：地址、1A、选项位、6B |
-| 实时位置 | Addr 36 6B | 8：地址、36、正负号、32位大端幅值、6B |
-| Emm 位置 | 见下文 | 4：地址、FD、确认状态、6B |
-
-版本示例 `01 1F 00 CE 23 14 6B` 对应 FW=206、硬件系列2、类型3、版本20。
-`2 '\002'` 是 GDB 对8位值的数值/字符双显示。
-
-3A 的数据是**位图**，不能把其中02或E2误当确认码：
-bit0 enabled；bit1 arrived；bit2 stalled；bit3 stall_protection；
-bit4 left_limit_level；bit5 right_limit_level；bit7 power_marker。
-左右限位是输入电平，并不直接等于“触发”，应结合实际限位设置。
-掉电标记默认0，可由电机命令置1，掉电后恢复0；本工程不修改它，因此不能仅凭0判定发生过掉电。
-
-命令确认码：02 接收正确；E2 参数/执行条件错误；EE 格式错误；9F 主动完成通知；
-12/22 表示未运动的相关零点/限位条件，按拒绝处理并保留原码。
-`comm_result` 是主机通信结果；电机拒绝时它仍可能是 OK，必须同时检查 transaction 和 reply_status。
-`reply_status_valid` 区分是否存在确认码。数据查询不会把状态数据当确认码。
-
-流解析使用8字节滑动窗口，按功能识别长度，搜索每个可行后缀，跳过前导噪声和错位；
-匹配不了的帧只计数，不完成事务。固定6B不具有CRC的检错能力，噪声伪造合法地址/功能/尾字节仍可能误判。
-本实现覆盖上表的数据帧以及4字节确认帧；没有实现全部厂商命令的数据长度。
-不要开启电机定时自动回传其他类型数据，单电机第一版也不支持本机 TX 自回显的收发器接法。
-
-## 事务与运动
-
-事务：IDLE → WAIT → SUCCESS / REJECTED / TIMEOUT / IO_ERROR。
-响应超时100ms；RS485 TX超时30ms。无符号时差支持tick回绕。
-超时/读取错误设置 resync_required，禁止直接重发。
-该协议没有序号，同地址、同功能的旧回复不能与新回复严格区分。
-只有在操作者确认电机已停止、旧会话已结束（必要时复位电机）后，才可显式恢复会话；
-恢复只清软件队列与协议缓存，未来迟到回复的风险依然存在。硬件 FAULT 需要检查后复位 MCU。
-
-Emm 帧13字节：`Addr FD Dir SpeedH SpeedL Acc P3 P2 P1 P0 Mode 00 6B`。
-API 使用输入脉冲数，不做未经确认的角度换算；速度1..3000RPM（本版拒绝0），加速度0..255档位，
-方向0/1，模式0/1/2，脉冲1..UINT32_MAX，运动监视期限100..120000ms。
-模式0相对前一目标，1绝对坐标，2相对当前实时位置；同步固定00立即执行。
-加速度0表示直接启动；档位越大加速越快，并非物理加速度单位。
-宽参数检查之后才窄化或按大端序拆字节。
-
-开始运动前，必须在同一地址得到1秒内的选项、状态、位置读回：
-选项bit1=1（Emm）、bit2=1（闭环）、bit7=0（不缩小输入），已使能、前一目标已到达、无堵转/保护。
-实际电机已由用户确认 Emm，选项读回作为运行时交叉核对；代码不会修改固件/闭环/缩放/使能参数。
-限位电平不用于猜测限位有效极性，E2/12/22拒绝码原样保留。
-运动进行中拒绝第二条运动及切换地址，只允许同地址只读事务。
-
-运动证据：
-- 发送启动OK：只证明驱动接受发送；UART TC只证明停止位发送完。
-- FD 02：command_accepted=true，不意味着已到达。
-- 确认后，实时位置相对运动前基线变化超过16编码器单位：started_observed=true。
-  这是位置变化证据，不能独自证明变化一定来自本条命令，也不代表达到指定目标。
-- 状态由未到达再到达，或运动期间收到FD 9F：motion=ARRIVED，arrived=true。
-- 自动交替轮询3A与36，每50ms发起一条，仍遵守单事务；不在循环中延时。
-- 很短的运动可能错过未到达状态，若应答配置又没有9F，会保持未证实并最终监视超时；不伪报完成。
-- 堵转、失能、监视超时或通信错误后停止自动调度，状态保留为FAULT/TIMEOUT/UNKNOWN。
-  **停止监视不等于电机急停**，本版没有发送停止或使能命令。
-
-## VS Code 实机步骤
-
-仅接一台电机；先核对PG8极性、A/B、共地、供电、终端、固定6B自由协议及电机应答设置。
-测试期间断点暂停会停止主循环并可能让DMA溢出；电机可能继续运动。运动中优先用连续观察和外部安全断电手段。
-观察 `'main.c'::s_debug`（或展开变量）。
-
-`request` 是一次性请求，处理后置0，失败不自动重试。暂停时填写参数，继续运行一小段后再暂停看结果。
-上电不会自动发任何查询或运动；初始化稳定后再开始测试。
-
-| request | 动作 |
+| 文件 | 职责 |
 |---|---|
-| 1 | 向 address 查询版本 |
-| 2 | 查询电机状态 |
-| 3 | 查询选项（核对Emm、闭环、缩放） |
-| 4 | 查询实时位置 |
-| 5 | 显式恢复会话，仅在已经人工确认会话干净且电机停止后使用 |
-| 6 | 显式小步相对运动，必须同时满足arm与读回前置条件 |
+| rs485.c/h | PG8方向控制、USART2 DMA收发、循环DMA到软件队列、错误锁定、快照 |
+| emm_v5.c/h | 根据厂家 Emm_V5.c 编码位置/使能/停止/读取帧；无HAL、无UART访问 |
+| zdt_x42s.c/h | 唯一RS485_Read消费者，帧解析、单事务、确认/超时、位置与到位证据 |
+| motor_app.c/h | 唯一应用调度者，500ms启动等待、显式请求、使能和运动准备流程、停止和结果 |
+| main.c | 初始化、按键与Watch请求路由、50ms调试快照 |
+| keycontrol.c/h | TIM6每10ms采样、消抖、原子取事件；原KEY_Proc仍保留但不调用 |
+| motor.c/h | 原STEP/DIR模块保留，不参与当前RS485业务 |
 
-1. `address=1, request=1`，继续运行，确认 result=OK、zdt.transaction=SUCCESS、version_valid=true，查看7字节原帧。
-2. `request=2`，确认状态帧4字节、enabled与arrived符合电机实际，逐一验证限位电平及堵转标志。
-3. 运动前人工核对步距角与细分。只有确认一圈3200输入脉冲时，80脉冲才等于9°；代码不假定这一设置。
-4. 依次发送request=3、2、4，每次等SUCCESS。各读回到运动发送的运行时间必须不超过1秒；调试暂停期间HAL tick通常不走。
-5. 初测可用 `direction=0, pulses=1, speed_rpm=5`；确认实际位移安全后逐步增加。
-   设置 `arm=0x454D4D31, request=6`，然后继续运行。pulses初值0会拒绝发送；arm用后立即清零。
-6. 小步接口只允许1..100脉冲、1..10RPM、方向0/1，加速度10档、模式2、监视10秒。
-   检查 zdt.command_accepted、started_observed、saw_not_arrived、motion、arrived，与实物和位置读回交叉核对。
-7. 再次测试必须重新取得新鲜读回并重新arm；不会自动重复运动，也不会自动使能。
-8. 一般位置API为 ZDT_X42S_StartEmmMove，返回发送启动结果；仅在上述小步验证后由应用显式调用。
+主循环固定为：
 
-主要观察：
-- rs485.state / last_hal_error / last_hal_status / last_error
-- rs485.last_tx_start_result / last_tx_result / tx_completed / tx_abort_failed
-- rs485.rx_bytes / overflow_count / queued_bytes
-- zdt.transaction / comm_result / last_start_result / resync_required
-- zdt.address / function / reply_status / reply_status_valid
-- zdt.last_frame_len / last_frame / frames / ignored_frames
-- zdt.version / status / options / position 及其valid、tick字段
-- zdt.motion / command_accepted / started_observed / arrived
+```c
+RS485_Proc();
+ZDT_X42S_Proc();
+Requests_Proc();
+MOTOR_AppProc();
+Debug_Proc();
+```
 
-## 软件验证与硬件待验证
+所有公开业务入口均为主循环调用，其他模块不能直接抢读RS485队列。
+中断只搬字节、更新驱动状态或采样按键，不做协议解析或运动准备。
 
-执行 `cmake --build --preset Debug`；主机回归执行 `sh tests/run.sh`。
-测试直接编译生产驱动与协议源码，HAL/DMA模拟运行，启用-Wall -Wextra -Werror与Address/Undefined sanitizers。
-覆盖DMA半满/满/回绕/重复与旧Size、队列溢出与清理、噪声错位/分包/错误地址、
-版本解析、3A位图与ACK区分、事务互斥、迟到回复、超时隔离、Emm命令编码、参数拒绝、
-02与运动/到位区分、异步9F、拒绝码与硬件故障锁定。
+## 显式运动流程
 
-必须实测：
-- 示波器确认PG8在最后停止位之后拉低，电机最短应答间隔内完成收发切换。
-- 持续接收跨越128/256边界，验证回调频率、中断延迟与长时间稳定性；软件模拟不能证明总线时序。
-- UART噪声/断线、RX溢出、TX超时及断电后错误记录，复位后的恢复流程。
-- 实际固件对1A返回长度是否与手册4字节表一致（手册正文另提bit8/9，存在表述不一致；本版不使用这些位）。
-- 选项缩放、步距角/细分、限位有效极性、掉电标记策略、命令应答配置与9F行为。
-- 单步低速方向/位移、02确认、实际位置变化、未到达→到达、拒绝、堵转与监视超时。
-- 小运动遗漏中间状态时，确认9F开启或接受“未证实完成”的结果。
+```mermaid
+flowchart LR
+  R[按键或Watch请求] --> O[1A核对Emm闭环和缩放]
+  O --> E[F3 AB显式使能并等待确认]
+  E --> S[3A核对使能与堵转状态]
+  S --> P[36取得运动前实际位置]
+  P --> M[FD位置控制]
+  M --> A[等待02或9F]
+  A --> V[监视位置变化和到位]
+```
 
-尚未连接实际MCU/电机进行烧录和运行；所有实机结论需按以上步骤确认。
+使能由本次明确的运动请求触发，不在上电时自动使能。
+各准备命令在上条回复后间隔10ms发起，非阻塞；单回复期限100ms。
+UART发送超时仍为30ms。任何失败都结束本次操作，不自动重发运动。
 
-## 暂停落在 memcpy 与旧 Watch 兼容
+到位标志Prf_TF是输出观察，不再当成首次运动必须成立的许可条件。
+运动进行中禁止第二条运动；运动超时、通信不确定或故障后禁止直接重发。
+使能、选项、位置数据必须有效且在1秒内；自动流程负责读新数据。
+F3发送成功后使能状态缓存失效；FD发送成功后，运动前的状态与实际位置缓存失效，
+基线单独保存在position_before_move中。FE发送成功后状态、实际位置和目标位置缓存失效。
+切换地址时，包括FE停止路径在内，所有地址相关缓存均失效。
 
-手动暂停显示 SIGINT 属于正常暂停，并不等于 HardFault。若调用栈为 memcpy →
-ZDT_X42S_GetDebug → Debug_Proc → main，这是调试快照复制。工具链中的 memcpy.c
-源码没有随工程提供，编辑器会提示文件不存在；不应创建一个空文件代替库源码。
-可以选择调用栈中的 main/Debug_Proc 查看工程源码，或使用“跳出”(Shift+F11)。
-需要稳定查看主循环时，在 main 中 Debug_Proc() 调用处设置断点，再继续运行到断点。
+运动确认后，查询发送间隔和距上一匹配回复的间隔均至少50ms，循环3A、36、33、24、27、34，分别获取状态、
+实际位置、最终目标位置、总线电压、相电流和轨迹实时设定位置。一次只有一个等待回复的事务。
+这也保证较慢的FD确认不会在同轮被自动查询覆盖，应用层能先处理本次运动确认。
 
-快照现最多每50ms刷新一次，显式请求会立即刷新，协议处理仍每轮执行。
-已恢复原有 Watch 名称：'zdt_x42s.c'::s_query.state、rx_len、comm_result、version，
-以及 main 的 s_dbg_state、s_dbg_version_ok、s_dbg_version、s_dbg_comm_result。
-state 表示版本查询状态；其他事务看 transaction。rx_len 在等待中表示滑动窗口字节数
-（可能包含噪声），结束后表示最近帧长度。新快照继续使用 'main.c'::s_debug。
+## Watch：先看应用结果
 
-修改后先停止原调试会话，重新下载新ELF再启动，避免目标固件与调试符号不一致。
-上电不会自动查询，需 request=1 显式触发版本查询；初值0/IDLE不是通信失败。
+保留 `'main.c'::s_debug`。以下字段含义不同：
+
+| 字段 | 应如何理解 |
+|---|---|
+| `result` | 最近一次新请求的接收结果，重复按键可能为BUSY |
+| `app.last_request_result` | 最近一次真正交给应用的请求结果 |
+| `app.result` | 当前/上次执行操作的结果；第二次按键的BUSY不会覆盖它 |
+| `app.stage` | 当前执行到哪一步 |
+| `app.active` | 是否还在准备、等待回复或监视运动 |
+| `app.failed_stage`、`app.error` | 最后失败的阶段和分类 |
+| `app.move` | 触发时捕获的参数；后续按键或Watch修改不会改变本次动作 |
+| `zdt.transaction` | 最近一条通信事务的结果，不代表整个运动结果 |
+| `zdt.move_reject` | 发送位置命令前被协议层拒绝的具体原因 |
+
+正常应用阶段：
+`BOOT_WAIT → IDLE → OPTIONS → ENABLE → STATUS → BASELINE → MOVE_ACK → MONITOR → DONE`。
+如果直接收到9F，可从MOVE_ACK直接进入DONE。
+失败进入FAILED。软件停止被接受进入STOP_ACCEPTED，不能把它解释成已经实测静止。
+
+旧 `zdt.preparation/preparation_result` 已移入应用层，用 `app.stage/app.result` 替代。
+旧 `s_query.state/rx_len/comm_result/version` 与 main 的 `s_dbg_*` 版本监视仍保留。
+`state`只指版本查询；非版本业务请看transaction和app.stage。
+
+Watch显式请求：设置参数，最后写request，然后连续运行。
+
+| request | 含义 |
+|---|---|
+| 1 / 2 / 3 / 4 | 版本 / 电机状态 / 选项 / 实际位置 |
+| 5 | 人工确认旧会话干净、电机停止后的协议恢复；不发送电机指令 |
+| 6 | 完整单次位置流程，需`arm=0x454D4D31`，用后清零 |
+| 7 / 8 / 9 | 总线电压 / 相电流 / 目标位置，只读 |
+| 10 | 软件停止请求，允许优先中断普通查询/准备流程 |
+| 11 / 12 | 单独使能 / 失能，只操作使能，不发送位置命令 |
+| 13 | 只读3B：编码器、校准、回零、过热/过流状态，结果见`zdt.health` |
+| 14 | 只读21：Emm PID，结果见`zdt.pid`；先执行request=3核对本地址Emm |
+| 15 | 只读42：Emm驱动配置，结果见`zdt.config`；先执行request=3 |
+| 16 | 只读23：积分限幅，结果见`zdt.integral_limit`和`integral_limit_valid` |
+| 17 | 只读34：轨迹实时设定位置，结果见`zdt.setpoint_position/setpoint_valid`；运动监视时自动轮询 |
+
+request=6读取address、direction、pulses、speed_rpm、acceleration、mode、timeout_ms。
+默认80脉冲、5RPM、acceleration=0、mode=0、timeout_ms=10000。
+位置模式0相对上一输入目标，1绝对目标，2相对当前实际位置。
+校准、恢复出厂、修改固件、修改PID/电流均未暴露为按键或上电动作。
+
+从业务代码触发一次：
+
+```c
+const ZDT_EmmMove_t move = {1U, 0U, 5U, 0U, 80U, 0U, 10000U};
+RS485_Result_t accepted = MOTOR_AppMove(&move);
+```
+
+返回OK表示应用接受请求，不等于FD已经发出或电机到位。
+不要放在while每轮调用；放在明确事件中，随后持续调用主循环任务。
+
+## 实际发帧和回复
+
+默认按键位置帧：`01 FD 00 00 05 00 00 00 00 50 00 00 6B`。
+使能帧：`01 F3 AB 01 00 6B`；失能帧：`01 F3 AB 00 00 6B`。
+停止帧：`01 FE 98 00 6B`。
+
+| 功能 | 正常回复长度 |
+|---|---|
+| 1F版本 | 7字节 |
+| 1A选项 | 5字节；本台实机确认`01 1A 00 06 6B`，16位大端选项 |
+| 3A状态 | 4字节，第三字节为位图，不能当确认码 |
+| 36实际位置 / 33最终目标位置 / 34轨迹实时设定位置 | 8字节，符号+32位大端幅值 |
+| 24电压 / 27相电流 | 5字节，16位大端数据 |
+| 3B编码器/校准/保护状态 | 4字节，第三字节为位图 |
+| 21 Emm PID / 23积分限幅 | 15 / 7字节，三个 / 一个32位大端整数 |
+| 42 Emm驱动配置 | 33字节，含`21 15`长度/参数个数；请求为`Addr 42 6C 6B` |
+| F3 / FD / FE确认 | 4字节，02接受、9F完成通知、E2/EE拒绝，保留12/22原码 |
+
+流解析识别明确的功能码和长度，优先保留最早的合法候选头，等待该帧完整后再解析，
+避免把位置等数据中的`01 FD 9F 6B`误当作独立完成通知。只有候选头、符号、确认码或帧尾不合法时
+才逐字节重新寻找帧头；伪候选头最多等待33字节即可检验。支持前导噪声、错位、分包。
+无关地址/功能不会完成当前事务。固定6B没有CRC的检错能力；不支持任意未知数据帧。
+
+关键证据：`zdt.last_tx/last_tx_len`为最近发送，`move_frame[13]`为本次运动帧，
+`move_reply[4]/move_reply_valid`保留运动确认，不会被后续查询覆盖。
+`command_accepted`仅说明FD被接受；`started_observed`需要位置变化超过16编码器单位。
+`position_before_move/position_delta`与`target_position`用于比对。
+到位要求观察到未到位→到位，或收到当前动作FD 9F。很短运动若错过中间状态且没9F，
+可能完成未证实并监视超时，不伪报到位。建议电机Response设置为Both，以取得确认和完成通知。
+
+## 失败、停止与恢复
+
+普通通信超时/溢出/硬件错误保留resync_required，禁止直接重发。
+停止请求在当前UART发送结束后发FE；原逻辑事务被取消，旧回复不完成FE事务。
+如果中断了等待回复的事务，或会话本就不确定，FE确认后仍要求显式恢复。
+若取消的是版本查询，旧版本查询状态转为ERROR，不再停留在WAIT_RESPONSE。
+协议没有事务序号，恢复不能识别未来同地址同功能码的迟到回复。
+
+恢复仅清已入软件队列的数据和协议缓存，不重启循环DMA、不重置DMA读游标。
+未由DMA回调搬运的字节、未来的迟到回复不在清理范围。硬件FAULT需查明原因后复位MCU。
+运动监视超时不等于电机已停止；需要操作者确认，必要时显式请求停止。
+
+## 硬件与已知限制
+
+继续使用USART2 PA2/PA3、115200 8N1、RX DMA1_Stream5 Circular、TX DMA1_Stream6 Normal。
+PG8使用RS485_EN宏，高发送、低接收。只有UART TC后才释放发送方向。
+本次未复制例程的USART1/PA9/PA10、168MHz HSE配置，也未改CubeMX初始化。
+
+RX缓冲128、队列256（可用255）、TX缓冲128。HT/TC/IDLE回调均保留，USART2与RX DMA
+抢占优先级相同；用实时NDTR避免旧HT Size导致重复回绕。持续满速流下应在约5.56ms内服务半缓冲，
+整圈覆盖后无法靠NDTR恢复丢失数据。软件溢出可检测并报告。
+
+实机仍需确认：MStep/步距角、校准、供电电流能力、电机绕组连接、限位有效极性、
+电流/电压限制、到位窗口和Response。之前现场11.5V、相电流15mA、目标更新但转子未跟随，
+不能仅凭这几个读回认定硬件损坏或已经修好。此重构尚未烧录测试，不自动校准或改电机参数。
+厂家接线图示例标注10–29V、3A以上电源，实际选型应对照本台电机和板卡。
+
+## 目标更新但无位移时的只读诊断
+
+2026-11-16用户调试截图：`command_accepted=true`，`position_before_move=4`，
+`position_delta=0`，`target_position=3268`，`bus_voltage_mv=11490`，
+`phase_current_ma=17`，目标/电压/电流均有效，`started_observed=false`。
+目标与实际相差3264编码单位，约17.93°，说明收到命令和产生实际位移是两个不同结果。
+这些反馈支持继续核查校准、PID、输出限制、绕组连接与驱动输出，尚不足以认定具体故障。
+
+本次新增request=13～16，仅发送只读查询。烧录新Debug固件后不按运动键，等待500ms，
+依次将`'main.c'::s_debug.request`设为3、13、14、15、16，每次连续运行至`app.stage=DONE`，
+再写下一项，最后查看：
+
+- `zdt.health`：`valid=true`后检查`encoder_ready`、`calibrated`及`over_temperature/over_current`。
+- `zdt.pid`：`valid=true`后记录`kp/ki/kd`；不要根据默认值盲目写回参数。
+- `zdt.config`：`valid=true`后记录`pulse_mode`、`enable_level`、`microsteps`、`max_current_ma`、
+  `max_output_raw`和`response_mode`。`max_output_raw`保留原始参数值，手册不同章节的单位倍数不一致。
+- `zdt.integral_limit`：同时确认`integral_limit_valid=true`。
+
+健康状态不就绪时先定位具体标志；参数为零或明显异常时与电机适用配置核对。
+参数正常仍不输出时，断电检查电机两相绕组连接及接插件，再进行驱动与电机的独立验证。
+查询入口不会校准、清保护、改PID、提高电流限制或发送运动。
+如果在旧会话已发生运动/通信超时，应用仍保留原锁定策略；不要为了读取诊断绕过不确定运动状态。
+
+进一步反馈：用户确认request=11后锁力增大；失能后手动转轴，实际位置从2061变为3901，
+变化1840单位约10.1°，与用户观察的11.3°→21.3°一致。健康状态raw=3，编码器和校准均就绪，
+未回零、未过热/过流。PID读回18000/20/1024000，积分限幅131072；配置为Hold、16细分、
+最大电流3000mA、输出限制原值5000。参数与部分手册默认值不同，尚未据此判定错误或写回。
+
+为区分最终目标已接收但轨迹未推进，或轨迹已推进但闭环未跟随，新增34只读查询和自动轮询。
+一次明确运动请求后约2秒，在有效位为true时同时比较target_position、setpoint_position和position，
+并查看phase_current_ma及status.enabled。最终目标与轨迹位置不同可以提示轨迹尚在推进或被中断；
+轨迹已到目标但实际位置不跟随则进一步查反馈匹配、闭环参数及驱动输出。
+单次34读回不能直接证明内部故障，也不能单凭某个PID值偏离手册默认值就覆盖参数。
+
+## 验证命令
+
+```sh
+cmake --build --preset Debug --clean-first
+sh tests/run.sh
+python3 tests/check_vendor_reference.py
+```
+
+最后一项从用户提供RAR只读提取已核对的三个函数，重定向HAL发送到测试缓冲，
+与生产编码器执行768组字节对比，不运行例程main或实际电机。
+主机测试直接编译生产编码器、协议、应用和驱动，覆盖完整使能/位置流程、拒绝/超时、
+重复请求BUSY不覆盖执行结果、停止抢占/迟到回复、DMA回绕/溢出、选项5字节、9F到位、
+位置数据内嵌完成通知、慢ACK与轮询间隔、跨地址缓存失效、版本查询取消、
+tick回绕、按键消抖，以及旧STEP/DIR接口的非法参数与脉冲数。软件模拟不能代替物理总线和电机验证。

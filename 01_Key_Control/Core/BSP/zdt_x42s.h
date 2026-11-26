@@ -87,6 +87,9 @@ typedef struct {
     uint32_t integral_limit;
     int64_t setpoint_position; /* 34: trajectory position, distinct from 33 final target. */
     bool setpoint_valid;
+    int64_t position_error; /* 37: signed Emm angle units, same scale as position. */
+    double position_deg, position_error_deg;
+    bool position_error_valid;
 } ZDT_Debug_t;
 
 /* All APIs run in the main loop; only this module calls RS485_Read. No broadcast. */

@@ -6,6 +6,7 @@
 #define RESPONSE_MS 100U
 #define FRESH_MS 1000U
 #define POLL_MS 50U
+#define EMM_DEGREES_PER_UNIT (360.0 / 65536.0)
 static ZDT_Debug_t s_query;
 static uint8_t window[EMM_V5_MAX_REPLY], used;
 static uint32_t txn_tick, motion_tick, motion_timeout, poll_tick, reply_tick;
@@ -56,6 +57,7 @@ static void SelectAddress(uint8_t address)
         s_query.health.valid = s_query.pid.valid = s_query.config.valid = false;
         s_query.integral_limit_valid = false;
         s_query.setpoint_valid = false;
+        s_query.position_error_valid = false;
         s_query.arrived = s_query.command_accepted = s_query.started_observed = false;
         s_query.state = ZDT_VERSION_IDLE;
     }
@@ -87,6 +89,7 @@ static RS485_Result_t Begin(const uint8_t *cmd, uint16_t len)
     } else if (s_query.function == 0x3AU) { s_query.status_valid = false; }
     else if (s_query.function == 0x1AU) { s_query.options_valid = false; }
     else if (s_query.function == 0x36U) { s_query.position_valid = false; }
+    else if (s_query.function == 0x37U) { s_query.position_error_valid = false; }
     else if (s_query.function == 0x33U) { s_query.target_valid = false; }
     else if (s_query.function == 0x34U) { s_query.setpoint_valid = false; }
     else if (s_query.function == 0x24U) { s_query.voltage_valid = false; }
@@ -157,6 +160,7 @@ RS485_Result_t ZDT_X42S_StartEmmMove(const ZDT_EmmMove_t *m)
         /* These snapshots describe the pre-command motor state. Keep the
          * baseline separately and require new readbacks for a later move. */
         s_query.status_valid = s_query.position_valid = false;
+        s_query.position_error_valid = false;
         s_query.position_delta = 0;
         memcpy(s_query.move_frame, cmd, sizeof(cmd));
         memset(s_query.move_reply, 0, sizeof(s_query.move_reply));
@@ -202,6 +206,7 @@ RS485_Result_t ZDT_X42S_StartStop(uint8_t addr)
     used = 0U; s_query.rx_len = 0U;
     SelectAddress(addr);
     s_query.status_valid = s_query.position_valid = s_query.target_valid = false;
+    s_query.position_error_valid = false;
     s_query.setpoint_valid = false;
     s_query.function = 0xFEU;
     s_query.transaction = ZDT_TXN_WAIT; s_query.comm_result = RS485_OK;
@@ -230,6 +235,7 @@ static void Fail(RS485_Result_t result)
     s_query.transaction = result == RS485_TIMEOUT ? ZDT_TXN_TIMEOUT : ZDT_TXN_IO_ERROR;
     s_query.resync_required = true;
     s_query.status_valid = s_query.position_valid = s_query.options_valid = false;
+    s_query.position_error_valid = false;
     if (s_query.function == 0x1FU) {
         s_query.state = result == RS485_TIMEOUT ? ZDT_VERSION_TIMEOUT : ZDT_VERSION_ERROR;
     }
@@ -302,14 +308,18 @@ static void AcceptFrame(const uint8_t *f, uint8_t n)
         uint16_t value = (uint16_t)(((uint16_t)f[2] << 8) | f[3]);
         if (f[1] == 0x24U) { s_query.bus_voltage_mv = value; s_query.voltage_valid = true; }
         else { s_query.phase_current_ma = value; s_query.current_valid = true; }
-    } else if (f[1] == 0x36U || f[1] == 0x33U || f[1] == 0x34U) {
-        uint32_t magnitude = ((uint32_t)f[3] << 24) | ((uint32_t)f[4] << 16) |
-                             ((uint32_t)f[5] << 8) | f[6];
+    } else if (f[1] == 0x36U || f[1] == 0x33U || f[1] == 0x34U || f[1] == 0x37U) {
+        uint32_t magnitude = ReadU32(f + 3);
         int64_t value = f[2] ? -(int64_t)magnitude : (int64_t)magnitude;
         if (f[1] == 0x33U) { s_query.target_position = value; s_query.target_valid = true; }
         else if (f[1] == 0x34U) { s_query.setpoint_position = value; s_query.setpoint_valid = true; }
-        else {
+        else if (f[1] == 0x37U) {
+            s_query.position_error = value;
+            s_query.position_error_deg = (double)value * EMM_DEGREES_PER_UNIT;
+            s_query.position_error_valid = true;
+        } else {
             s_query.position = value;
+            s_query.position_deg = (double)value * EMM_DEGREES_PER_UNIT;
             s_query.position_valid = true; s_query.position_tick = HAL_GetTick();
             if (s_query.command_accepted) { s_query.position_delta = value - baseline; }
             if (Moving() && s_query.command_accepted &&
@@ -325,13 +335,18 @@ static void AcceptFrame(const uint8_t *f, uint8_t n)
             (b & 32U) != 0U, (b & 128U) != 0U};
         s_query.status_valid = true; s_query.status_tick = HAL_GetTick();
         if (Moving() && s_query.command_accepted) {
+            /* Small or fast moves can keep the arrival flag set between polls.
+             * With no observed edge, require the post-command trajectory (34)
+             * to have reached the final target (33). */
+            bool trajectory_done = s_query.target_valid && s_query.setpoint_valid &&
+                                   s_query.setpoint_position == s_query.target_position;
             if (!s_query.status.enabled || s_query.status.stalled || s_query.status.stall_protection) {
                 s_query.motion = ZDT_MOTION_FAULT;
             } else if (!s_query.status.arrived) {
                 s_query.saw_not_arrived = true;
                 /* Not at target is not proof that the rotor is moving. */
                 s_query.motion = s_query.started_observed ? ZDT_MOTION_MOVING : ZDT_MOTION_ACCEPTED;
-            } else if (s_query.saw_not_arrived) {
+            } else if (s_query.saw_not_arrived || trajectory_done) {
                 s_query.motion = ZDT_MOTION_ARRIVED; s_query.arrived = true;
             }
         }
@@ -360,7 +375,7 @@ static void Feed(uint8_t byte)
         bool invalid = !f[0] || len == 0U;
         if (!invalid && used >= 3U) {
             invalid = (f[1] >= 0xF0U && !EMM_V5_IsAckStatus(f[2])) ||
-                      ((f[1] == 0x36U || f[1] == 0x33U || f[1] == 0x34U) && f[2] > 1U);
+                      ((f[1] == 0x36U || f[1] == 0x33U || f[1] == 0x34U || f[1] == 0x37U) && f[2] > 1U);
             if (f[1] == 0x42U && f[2] != 33U) { invalid = true; }
         }
         if (!invalid && f[1] == 0x42U && used >= 4U && f[3] != 21U) { invalid = true; }

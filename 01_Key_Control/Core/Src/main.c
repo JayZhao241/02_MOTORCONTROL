@@ -39,7 +39,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define APP_MOTOR_ADDRESS 1U
-#define APP_JOG_PULSES    80U  /* Input pulses, NOT degrees. */
+#define APP_JOG_PULSES    1U  /* Input pulses, NOT degrees. */
 #define APP_JOG_RPM       5U
 #define APP_JOG_ACCEL     0U   /* Vendor position example: direct low-speed start. */
 #define APP_JOG_MODE      0U   /* Vendor position example: previous-target relative. */
@@ -62,7 +62,8 @@ static volatile RS485_Result_t s_dbg_comm_result = RS485_OK;
 /* Explicit Watch requests: 1 version, 2 status, 3 options, 4 position,
  * 5 recover, 6 move (arm required), 7 voltage, 8 current, 9 target,
  * 10 stop, 11 enable, 12 disable, 13 health, 14 Emm PID, 15 Emm config,
- * 16 integral limit, 17 trajectory position. Nothing is sent on startup. */
+ * 16 integral limit, 17 trajectory position, 18 position error.
+ * Nothing is sent on startup. */
 static volatile struct {
     uint32_t request;
     uint8_t address;
@@ -127,6 +128,7 @@ static void Requests_Proc(void)
         case 15: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x42U); break;
         case 16: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x23U); break;
         case 17: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x34U); break;
+        case 18: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x37U); break;
         default: s_debug.result = RS485_INVALID_PARAM; break;
         }
         return;

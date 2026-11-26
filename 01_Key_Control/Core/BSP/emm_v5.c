@@ -36,7 +36,7 @@ uint8_t EMM_V5_ReplyLength(uint8_t function)
     case 0x23: return 7U;
     case 0x42: return 33U; /* Emm driver configuration. */
     case 0x1A: case 0x24: case 0x27: return 5U;
-    case 0x33: case 0x34: case 0x36: return 8U;
+    case 0x33: case 0x34: case 0x36: case 0x37: return 8U;
     case 0x3A: case 0x3B: case 0xF3: case 0xFD: case 0xFE: return 4U;
     default: return 0U;
     }

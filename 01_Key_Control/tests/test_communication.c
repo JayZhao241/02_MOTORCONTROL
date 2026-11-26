@@ -57,9 +57,9 @@ static const uint8_t position0[] = {1,0x36,0,0,0,0,0,0x6B};
 static const uint8_t enable_ack[] = {1,0xF3,2,0x6B};
 static const uint8_t move_ack[] = {1,0xFD,2,0x6B};
 static const ZDT_EmmMove_t jog = {1,0,5,0,80,0,10000};
-static void start_jog(void)
+static void start_move(const ZDT_EmmMove_t *move, const uint8_t status[4])
 {
-    assert(MOTOR_AppMove(&jog) == RS485_OK);
+    assert(MOTOR_AppMove(move) == RS485_OK);
     pump(10); assert(tx[1] == 0x1A && application().waiting_for_reply);
     reply(options,sizeof(options));
     assert(application().stage == MOTOR_APP_ENABLE);
@@ -69,13 +69,14 @@ static void start_jog(void)
     assert(tx_len == 6 && !memcmp(tx,expected_enable,6));
     reply(enable_ack,sizeof(enable_ack));
     pump(10); assert(tx[1] == 0x3A);
-    reply(enabled,sizeof(enabled)); /* No arrival bit before the first move. */
+    reply(status,4);
     pump(10); assert(tx[1] == 0x36);
     reply(position0,sizeof(position0));
     pump(10); assert(tx[1] == 0xFD && tx_len == 13);
-    const uint8_t expected_move[] = {1,0xFD,0,0,5,0,0,0,0,80,0,0,0x6B};
+    const uint8_t expected_move[] = {1,0xFD,0,0,5,0,0,0,0,(uint8_t)move->pulses,0,0,0x6B};
     assert(!memcmp(tx,expected_move,13));
 }
+static void start_jog(void) { start_move(&jog, enabled); }
 int main(void)
 {
     uint8_t frame[13];
@@ -161,6 +162,36 @@ int main(void)
     assert(application().stage==MOTOR_APP_DONE && protocol().arrived);
     assert(protocol().bus_voltage_mv==12000 && protocol().phase_current_ma==500);
     assert(protocol().move_reply_valid && !memcmp(protocol().move_reply,move_ack,4));
+
+    /* Receive mode sends only 02. A one-pulse move can keep Prf_TF set
+     * throughout. Require the trajectory to reach the final target first. */
+    ZDT_EmmMove_t single = jog;
+    single.pulses = 1U;
+    start_move(&single, arrived); reply(move_ack,4);
+    const uint8_t trajectory_positions[] = {0U, 20U};
+    for (unsigned i = 0U; i < sizeof(trajectory_positions); i++) {
+        pump(50); assert(tx[1]==0x3A); reply(arrived,4);
+        assert(application().stage==MOTOR_APP_MONITOR && !protocol().saw_not_arrived);
+        assert(MOTOR_AppMove(&single)==RS485_BUSY);
+        const uint8_t single_position[]={1,0x36,0,0,0,0,20,0x6B};
+        const uint8_t single_target[]={1,0x33,0,0,0,0,20,0x6B};
+        const uint8_t trajectory[]={1,0x34,0,0,0,0,trajectory_positions[i],0x6B};
+        pump(50); assert(tx[1]==0x36); reply(single_position,8);
+        pump(50); assert(tx[1]==0x33); reply(single_target,8);
+        pump(50); assert(tx[1]==0x24); reply(voltage,5);
+        pump(50); assert(tx[1]==0x27); reply(current,5);
+        pump(50); assert(tx[1]==0x34); reply(trajectory,8);
+    }
+    assert(application().stage==MOTOR_APP_MONITOR);
+    pump(50); assert(tx[1]==0x3A); reply(arrived,4);
+    assert(application().stage==MOTOR_APP_DONE && protocol().arrived);
+    assert(!protocol().saw_not_arrived && !protocol().resync_required);
+    start_move(&single, arrived); reply(move_ack,4);
+    assert(!protocol().target_valid && !protocol().setpoint_valid);
+    const uint8_t stalled_at_target[]={1,0x3A,0x0B,0x6B};
+    pump(50); assert(tx[1]==0x3A); reply(stalled_at_target,4);
+    assert(application().error==MOTOR_APP_STALL && !protocol().arrived);
+    assert(MOTOR_AppRecover()==RS485_OK);
 
     /* Bad options: no enable or FD emitted; motor rejection: no motion retry. */
     assert(MOTOR_AppMove(&jog)==RS485_OK); pump(10);
@@ -322,6 +353,27 @@ int main(void)
     assert(!protocol().position_valid && !protocol().target_valid && !protocol().started_observed);
     assert(MOTOR_AppQuery(2,0x3B)==RS485_OK); pump(10); reply(healthy2,4);
     assert(!protocol().setpoint_valid);
+    assert(MOTOR_AppRecover()==RS485_OK);
+
+    /* Watch angles use Emm encoder units, including negative position error. */
+    assert(MOTOR_AppQuery(1,0x36)==RS485_OK); pump(10);
+    const uint8_t fine_position[]={1,0x36,0,0,0,0,20,0x6B};
+    reply(fine_position,8);
+    assert(protocol().position_valid && protocol().position_deg==0.10986328125);
+    assert(MOTOR_AppQuery(1,0x37)==RS485_OK); pump(10);
+    const uint8_t error_query[]={1,0x37,0x6B};
+    assert(tx_len==3 && !memcmp(tx,error_query,3));
+    const uint8_t invalid_error[]={1,0x37,2,0,0,0,8,0x6B};
+    reply(invalid_error,8);
+    assert(!protocol().position_error_valid && protocol().transaction==ZDT_TXN_WAIT);
+    const uint8_t negative_error[]={1,0x37,1,0,0,0,8,0x6B};
+    inject(negative_error,4); pump(1); assert(!protocol().position_error_valid);
+    inject(negative_error+4,4); pump(1);
+    assert(protocol().position_error_valid && protocol().position_error==-8);
+    assert(protocol().position_error_deg==-0.0439453125);
+    assert(protocol().position_valid && protocol().position_deg==0.10986328125);
+    assert(MOTOR_AppQuery(2,0x3B)==RS485_OK); pump(10); reply(healthy2,4);
+    assert(!protocol().position_valid && !protocol().position_error_valid);
     assert(MOTOR_AppRecover()==RS485_OK);
 
     /* Response deadline handles tick wrap, fault latch survives late TC. */

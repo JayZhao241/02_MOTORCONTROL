@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "运行电机控制台（演示）",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"desktop.app"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

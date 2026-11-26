@@ -1,0 +1,1 @@
+"""Desktop motor control application."""

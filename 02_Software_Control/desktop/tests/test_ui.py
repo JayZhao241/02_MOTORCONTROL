@@ -149,9 +149,9 @@ class UITests(unittest.TestCase):
             self.app._connection_changed()
         self.assertIn("CH340", self.app.port_choice.get())
         self.assertEqual(self.app.port.get(), usb.device)
-        with patch("desktop.app.SerialBackend", side_effect=ValueError("测试连接")) as factory:
+        with patch("desktop.app.DualSerialBackend", side_effect=ValueError("测试连接")) as factory:
             self.app._connect()
-            factory.assert_called_once_with(usb.device, "115200", "1", "3200")
+            factory.assert_called_once_with(usb.device, "115200", "3200")
         with patch("desktop.app.serial_port_details", return_value=[]):
             self.app._scan_ports()
         self.assertEqual(self.app.port.get(), "")
@@ -203,9 +203,10 @@ class UITests(unittest.TestCase):
         self.assertTrue(self.app.elf_button.winfo_viewable())
         self.assertFalse(self.app.baud_widgets[1].winfo_viewable())
         self.assertIn("ST-Link", self.app.device_label.get())
-        with patch("desktop.app.StLinkBackend", side_effect=ValueError("测试连接")) as factory:
+        with patch("desktop.app.DualSerialBackend", side_effect=ValueError("测试连接")) as factory:
             self.app._connect()
-            factory.assert_called_once_with("ABC123", "1", "3200", self.app.elf_path.get())
+            self.assertEqual(factory.call_args.args, ("ABC123",))
+            self.assertEqual(factory.call_args.kwargs["pulses_per_turn"], "3200")
 
     def test_confirmation_keeps_connection_and_blocks_another_jog(self):
         state = replace(self.app.controller.snapshot(), connected=True, enabled=True, motion="confirming")
@@ -225,7 +226,7 @@ class UITests(unittest.TestCase):
 
     def test_save_startup_origin_button_is_explicit(self):
         self.connect_enabled()
-        self.app.controller.backend.position = 25
+        self.app.controller.backend.axes[0].position = 25
         self.assertEqual(self.app.origin_button.cget("text"), "保存为开机零点")
         self.app.origin_button.invoke()
         self.app._advance()
@@ -265,6 +266,121 @@ class UITests(unittest.TestCase):
                     self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
                                          ancestor.winfo_rooty() + ancestor.winfo_height(), str(widget))
                     ancestor = ancestor.master
+
+    def test_axis_selection_and_pose_scan(self):
+        self.connect_enabled()
+        self.app.motor_picker.current(1)
+        self.app._motor_changed()
+        self.app._enable()
+        self.assertTrue(self.app.controller.backend.axes[1].snapshot().enabled)
+        self.app.workspaces.select(1)
+        self.app.update()
+        self.app._calibrate_pose()
+        self.assertIsNotNone(self.app.pose.center)
+        self.app.pose.move(5, 0, 1)
+        self.app.controller.update(2)
+        self.assertEqual(self.app.pose.coordinates(), (5, 0))
+        self.app.pose.sweep("beta", 2, 5, 1, 2)
+        self.app._stop()
+        self.assertFalse(self.app.pose.sequence)
+        self.assertTrue(all(a.snapshot().motion == "idle" for a in self.app.controller.backend.axes))
+
+    def test_pose_controls_fit_800_height(self):
+        self.app.geometry("1060x800")
+        self.app.workspaces.select(1)
+        for page, widgets in ((0, (self.app.pose_move_button, self.app.pose_zero_button)),
+                              (1, (self.app.pose_scan_button,)),
+                              (2, (self.app.calibrate_button, self.app.apply_limits_button))):
+            self.app.pose_tabs.select(page)
+            self.app.update()
+            for widget in (*widgets, self.app.enable_all_button):
+                self.assertTrue(widget.winfo_viewable(), str(widget))
+                self.assertGreaterEqual(widget.winfo_height(), widget.winfo_reqheight(), str(widget))
+                ancestor = widget.master
+                while ancestor is not None:
+                    self.assertLessEqual(widget.winfo_rooty()+widget.winfo_height(), ancestor.winfo_rooty()+ancestor.winfo_height(), str(widget))
+                    ancestor = ancestor.master
+
+    def test_single_and_dual_controls_are_separate(self):
+        self.assertEqual(len(self.app.tabs.tabs()), 2)
+        self.assertEqual(len(self.app.workspaces.tabs()), 2)
+        self.app.workspaces.select(1)
+        self.app.update()
+        self.assertFalse(self.app.motor_picker.winfo_viewable())
+        self.assertFalse(self.app.enable_button.winfo_viewable())
+        self.assertTrue(self.app.enable_all_button.winfo_viewable())
+        self.assertTrue(self.app.dual_feedback.winfo_viewable())
+        self.assertFalse(self.app.single_feedback.winfo_viewable())
+        self.app.workspaces.select(0)
+        self.app.update()
+        self.assertTrue(self.app.motor_picker.winfo_viewable())
+        self.assertTrue(self.app.single_feedback.winfo_viewable())
+
+    def test_parameter_hints_and_experimental_ranges(self):
+        self.app.alpha.set("30")
+        self.app.beta.set("8")
+        self.assertIn("+38°", self.app.pose_preview.get())
+        self.assertIn("+22°", self.app.pose_preview.get())
+        self.app.sweep_axis.set("俯仰 β")
+        self.assertEqual(self.app.fixed_label.get(), "固定扇扫 α")
+        self.assertIsNone(self.app.pose.limits)
+        self.app.use_limits.set(True)
+        self.app.alpha_limit.set("42")
+        self.app.beta_limit.set("12")
+        self.app._apply_limits()
+        self.assertEqual(self.app.pose.limits, (42, 12))
+        self.app.alpha_limit.set("0")
+        self.app._apply_limits()
+        self.assertEqual(self.app.pose.limits, (42, 12))
+        self.app.use_limits.set(False)
+        self.app._apply_limits()
+        self.assertIsNone(self.app.pose.limits)
+
+    def test_offline_pose_does_not_display_stale_feedback(self):
+        self.connect_enabled()
+        self.app.controller.backend.enable_all()
+        self.app.pose.calibrate(1, 1)
+        self.app.controller.backend.axes[0].position = 10
+        self.app.controller.backend.axes[1].position = 10
+        self.app.controller.disconnect()
+        self.app._refresh()
+        self.assertIn("离线", self.app.pose_feedback.get())
+        self.assertNotIn("α=", self.app.pose_feedback.get())
+
+    def test_busy_action_has_immediate_progress_and_edit_lock(self):
+        self.connect_enabled()
+        self.app.step.set("90")
+        self.app.forward_button.invoke()
+        self.assertIsNotNone(self.app._busy_since)
+        self.assertIn("已用",self.app.elapsed_text.get())
+        self.assertTrue(all(entry.instate(["disabled"]) for entry in self.app.motion_inputs))
+        self.assertIn(str(self.app.progress.cget("mode")), ("indeterminate","determinate"))
+        self.app._stop()
+        self.assertIsNone(self.app._busy_since)
+        self.assertTrue(all(entry.instate(["!disabled"]) for entry in self.app.motion_inputs))
+
+    def test_connection_stage_is_visible_without_fake_percent(self):
+        states = [replace(a.snapshot(), motion="connecting") for a in self.app.controller.backend.axes]
+        self.app._activity(states,True,False)
+        self.assertEqual(str(self.app.progress.cget("mode")),"indeterminate")
+        self.assertIn("已用",self.app.elapsed_text.get())
+
+    def test_workflow_names_current_single_motor(self):
+        self.connect_enabled()
+        self.app.motor_picker.current(1); self.app._motor_changed(); self.app._enable()
+        self.assertIn("ID 2", self.app.workflow_text.get())
+
+    def test_nearest_zero_shows_single_turn_zero_and_keeps_turn_count(self):
+        self.connect_enabled()
+        self.app.controller.backend.axes[0].position = 730
+        self.app.zero_button.invoke()
+        self.assertEqual(self.app.controller.snapshot().target_deg,720)
+        self.app.controller.update(1)
+        self.app._refresh()
+        self.assertEqual(self.app.angle.get(),"0.000°")
+        self.assertIn("+720.000°",self.app.angle_caption.get())
+        self.assertEqual(self.app.controller.backend.axes[1].position,0)
+        self.assertEqual(self.app.zero_button.cget("text"),"就近回零")
 
 
 if __name__ == "__main__":

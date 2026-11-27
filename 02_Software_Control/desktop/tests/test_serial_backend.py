@@ -185,5 +185,39 @@ class SerialTests(unittest.TestCase):
         self.assertFalse(self.backend.snapshot().connected)
 
 
+class QueryRetryTests(unittest.TestCase):
+    def backend(self, function, count):
+        serial=FakeSerial()
+        original=serial.write
+        dropped=[count]
+        def write(packet):
+            result=original(packet)
+            if packet[1]==function and dropped[0]:
+                dropped[0]-=1; serial.buffer.clear()
+            return result
+        serial.write=write
+        backend=SerialBackend("test"); backend._serial=serial
+        from unittest.mock import Mock
+        backend._record_timeout=Mock()
+        return backend,serial
+
+    def test_read_only_timeout_gets_exactly_one_retry(self):
+        backend,serial=self.backend(0x3A,1)
+        self.assertEqual(backend._status(),2)
+        self.assertEqual([f[1] for f in serial.frames],[0x3A,0x3A])
+
+    def test_persistent_read_failure_is_not_silently_masked(self):
+        backend,serial=self.backend(0x3A,3)
+        with self.assertRaisesRegex(RuntimeError,"ID 1.*3A"):
+            backend._status()
+        self.assertEqual(len(serial.frames),2)
+
+    def test_lost_motion_ack_is_never_retried(self):
+        backend,serial=self.backend(0xFD,1)
+        with self.assertRaises(RuntimeError):
+            backend._exchange(0xFD,bytes.fromhex("00 00 05 00 00 00 00 50 02 00"))
+        self.assertEqual([f[1] for f in serial.frames],[0xFD])
+
+
 if __name__ == "__main__":
     unittest.main()

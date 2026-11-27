@@ -11,15 +11,25 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 if __package__:
-    from .controller import Controller, DemoBackend, firmware_default_rpm
+    from .controller import Controller, DemoBackend, firmware_default_rpm, number
     from .serial_backend import SerialBackend, serial_port_details
     from .stlink_backend import StLinkBackend, DEFAULT_ELF, stlink_probes
 else:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from desktop.controller import Controller, DemoBackend, firmware_default_rpm
+    from desktop.controller import Controller, DemoBackend, firmware_default_rpm, number
     from desktop.serial_backend import SerialBackend, serial_port_details
     from desktop.stlink_backend import StLinkBackend, DEFAULT_ELF, stlink_probes
+
+
+if __package__:
+    from .dual_backend import DualDemoBackend, DualSerialBackend
+    from .pose_control import PoseControl
+    from .bridge_transport import BridgeTransport
+else:
+    from desktop.dual_backend import DualDemoBackend, DualSerialBackend
+    from desktop.pose_control import PoseControl
+    from desktop.bridge_transport import BridgeTransport
 
 
 BG = "#F2F5FA"
@@ -38,14 +48,36 @@ class MotorApp(tk.Tk):
         self.geometry(f"1180x{max(800, min(900, self.winfo_screenheight() - 100))}")
         self.minsize(1060, 800)
         self.configure(bg=BG)
-        self.controller = Controller()
+        self.controller = Controller(DualDemoBackend())
+        self.pose = PoseControl(self.controller.backend)
+        self.motor_choice = tk.StringVar(value="电机1 · 左轴 · ID 1")
+        self.alpha = tk.StringVar(value="0")
+        self.beta = tk.StringVar(value="0")
+        self.pose_rpm = tk.StringVar(value="1")
+        self.left_sign = tk.StringVar(value="+1")
+        self.right_sign = tk.StringVar(value="+1")
+        self.sweep_axis = tk.StringVar(value="扇扫 α")
+        self.amplitude = tk.StringVar(value="1")
+        self.sweep_rpm = tk.StringVar(value="1")
+        self.use_limits = tk.BooleanVar(value=False)
+        self.alpha_limit = tk.StringVar()
+        self.beta_limit = tk.StringVar()
+        self.limit_status = tk.StringVar(value="未启用软件限位；机械范围待实验测量")
+        self.fixed_label = tk.StringVar(value="固定俯仰 β")
+        self.pose_preview = tk.StringVar()
+        self.sweep_preview = tk.StringVar()
+        self.status_title = tk.StringVar(value="单电机反馈 · ID 1")
+        self.dual_status = tk.StringVar()
+        self.fixed = tk.StringVar(value="0")
+        self.cycles = tk.StringVar(value="1")
+        self.dual_info = tk.StringVar()
         self.default_rpm = firmware_default_rpm()
         self.last_update = time.monotonic()
         self.last_motion = "idle"
         self.position_rpm = tk.StringVar(value=str(self.default_rpm))
         self.continuous_rpm = tk.StringVar(value=str(self.default_rpm))
         self.step = tk.StringVar(value="1")
-        self.target = tk.StringVar(value="90")
+        self.target = tk.StringVar(value="0")
         self.duration = tk.StringVar(value="10")
         self.direction = tk.IntVar(value=0)
         self.unlock = tk.BooleanVar(value=False)
@@ -69,10 +101,25 @@ class MotorApp(tk.Tk):
         self.notice = tk.StringVar(value="请选择连接方式")
         self.connection = tk.StringVar(value="未连接")
         self.angle = tk.StringVar(value="—")
+        self.angle_caption = tk.StringVar(value="单圈角度 · 累计角度 —")
         self.info: dict[str, tk.StringVar] = {}
         self.actions: list[ttk.Button] = []
+        self.navigation = []
+        self.motion_inputs = []
+        self.activity_text = tk.StringVar(value="连接设备，开始控制")
+        self.elapsed_text = tk.StringVar()
+        self.workflow_text = tk.StringVar()
+        self.link_text = tk.StringVar()
+        self._busy_since = None
+        self._scanning = False
+        self._scan_total = 0
+        self._move_starts = None
+        self._progress_mode = None
         self._styles()
         self._layout()
+        for variable in (self.alpha, self.beta, self.sweep_axis, self.amplitude, self.fixed, self.cycles):
+            variable.trace_add("write", self._parameter_hints)
+        self._parameter_hints()
         self.port_choice.trace_add("write", self._port_selected)
         for var in (self.continuous_rpm, self.duration, self.direction):
             var.trace_add("write", self._invalidate_lock)
@@ -90,7 +137,7 @@ class MotorApp(tk.Tk):
         style.configure("TLabel", background=WHITE, foreground=INK, font=(self.font_family, 10))
         style.configure("Muted.TLabel", foreground=MUTED, font=(self.font_family, 9))
         style.configure("Section.TLabel", font=(self.font_family, 13, "bold"))
-        style.configure("TButton", font=(self.font_family, 10), padding=(12, 9),
+        style.configure("TButton", font=(self.font_family, 10), padding=(10, 7),
                         background="#EAF0FC", foreground=INK, borderwidth=0)
         style.map("TButton", background=[("active", "#DCE7FF"), ("disabled", "#F1F3F7")],
                   foreground=[("disabled", "#9AA7B9")])
@@ -100,8 +147,24 @@ class MotorApp(tk.Tk):
         style.configure("Stop.TButton", background=RED, foreground=WHITE, font=(self.font_family, 12, "bold"))
         style.map("Stop.TButton", background=[("active", "#AD2531")])
         style.configure("TEntry", padding=7, fieldbackground="#F8FAFD", bordercolor=LINE)
+        style.configure("Input.TEntry", padding=7, fieldbackground="#FFFFFF", bordercolor="#7C9DE8",
+                        font=(self.font_family, 12))
+        style.configure("TLabelframe", background=WHITE, bordercolor=LINE)
+        style.configure("TLabelframe.Label", background=WHITE, foreground=BLUE, font=(self.font_family, 10, "bold"))
         style.configure("TNotebook", background=WHITE, borderwidth=0)
-        style.configure("TNotebook.Tab", padding=(20, 11), font=(self.font_family, 11))
+        style.layout("Flat.TNotebook", [("Notebook.client", {"sticky": "nswe"})])
+        style.layout("Flat.TNotebook.Tab", [])
+        for name, large, selected in (("Nav.TButton",False,False),("NavSelected.TButton",False,True),
+                                       ("NavLarge.TButton",True,False),("NavSelectedLarge.TButton",True,True)):
+            style.configure(name, background=BLUE if selected else "#E9EFF8", foreground=WHITE if selected else MUTED,
+                            padding=(10, 6 if large else 4), font=(self.font_family, 11 if large else 10, "bold"), borderwidth=0)
+            style.map(name, background=[("disabled", "#EDF1F7"), ("active", "#174AC7" if selected else "#DCE6F4")],
+                      foreground=[("disabled", "#9AA7B9")])
+        style.configure("TCombobox", padding=5, fieldbackground=WHITE, background="#EDF2F8", bordercolor=LINE, arrowcolor=MUTED)
+        style.map("TCombobox", fieldbackground=[("readonly", WHITE), ("disabled", "#F2F4F8")], selectbackground=[("readonly", WHITE)], selectforeground=[("readonly", INK)])
+        style.configure("Activity.Horizontal.TProgressbar", background=BLUE, troughcolor="#E8EDF5", borderwidth=0, thickness=4)
+        style.configure("TNotebook.Tab", padding=(12, 5), font=(self.font_family, 10))
+        style.configure("Workspace.TNotebook.Tab", padding=(14, 7), font=(self.font_family, 12, "bold"))
         style.map("TNotebook.Tab", background=[("selected", "#EAF0FC")], foreground=[("selected", BLUE)])
         style.configure("TRadiobutton", background=WHITE, foreground=INK, padding=8)
         style.configure("TCheckbutton", background=WHITE, foreground=INK, padding=6)
@@ -119,17 +182,18 @@ class MotorApp(tk.Tk):
         return button
 
     def _layout(self) -> None:
-        header = tk.Frame(self, bg="#142747", padx=26, pady=10)
+        header = tk.Frame(self, bg="#142747", padx=26, pady=8)
         header.pack(fill="x")
         line = tk.Frame(header, bg="#142747")
         line.pack(fill="x")
-        tk.Label(line, text="电机控制台", bg="#142747", fg=WHITE,
+        tk.Label(line, text="Motor Desk", bg="#142747", fg=WHITE,
                  font=(self.font_family, 20, "bold")).pack(side="left")
-        ttk.Button(line, text="■  停止 / Esc", style="Stop.TButton", command=self._stop).pack(side="right")
+        tk.Label(line, text="双轴运动控制台", bg="#142747", fg="#B5C6E1", font=(self.font_family, 11)).pack(side="left", padx=16)
+        ttk.Button(line, text="■  全部停止 / Esc", style="Stop.TButton", command=self._stop).pack(side="right")
 
-        content = tk.Frame(self, bg=BG, padx=22, pady=12)
+        content = tk.Frame(self, bg=BG, padx=22, pady=8)
         content.pack(fill="both", expand=True)
-        connection = ttk.Frame(content, padding=(16, 10))
+        connection = ttk.Frame(content, padding=(16, 7))
         connection.pack(fill="x", pady=(0, 8))
         self._label(connection, "设备连接", "Section.TLabel").pack(side="left", padx=(0, 18))
         self.mode_picker = ttk.Combobox(connection, textvariable=self.connection_mode,
@@ -139,10 +203,8 @@ class MotorApp(tk.Tk):
         ttk.Label(connection, textvariable=self.connection, foreground=BLUE).pack(side="left", padx=16)
         self.connect_button = self._button(connection, "连接", self._connect, primary=True, managed=False)
         self.connect_button.pack(side="right")
-        self.enable_button = self._button(connection, "使能电机", self._enable, managed=False)
-        self.enable_button.pack(side="right", padx=10)
-        self.serial_settings = ttk.Frame(content, padding=(12, 8))
-        self.serial_settings.pack(fill="x", pady=(0, 10))
+        self.serial_settings = ttk.Frame(content, padding=(12, 6))
+        self.serial_settings.pack(fill="x", pady=(0, 6))
         port_row = ttk.Frame(self.serial_settings)
         port_row.pack(fill="x")
         ttk.Label(port_row, textvariable=self.device_label).pack(side="left", padx=(0, 10))
@@ -151,17 +213,18 @@ class MotorApp(tk.Tk):
         self.scan_button = ttk.Button(port_row, text="刷新设备", command=self._scan_ports)
         self.scan_button.pack(side="left", padx=(10, 0))
         settings_row = ttk.Frame(self.serial_settings)
+        self.settings_row = settings_row
         settings_row.pack(fill="x", pady=(6, 0))
         self.serial_entries = [self.port_picker]
         self.baud_widgets = []
         self.elf_button = ttk.Button(settings_row, text="选择固件 ELF", command=self._choose_elf)
-        for label, variable, width in (("波特率", self.baudrate, 9), ("地址", self.address, 4), ("每圈脉冲", self.pulses, 8)):
+        for label, variable, width in (("波特率", self.baudrate, 9), ("每圈脉冲", self.pulses, 8)):
             field_label = self._label(settings_row, label)
             field_label.pack(side="left", padx=(0, 5))
             entry = ttk.Entry(settings_row, textvariable=variable, width=width)
             entry.pack(side="left", padx=(0, 12))
             self.serial_entries.append(entry)
-            if variable is self.address:
+            if variable is self.pulses:
                 self.address_label = field_label
             if variable is self.baudrate:
                 self.baud_widgets.extend((field_label, entry))
@@ -177,84 +240,340 @@ class MotorApp(tk.Tk):
         body.columnconfigure(0, weight=3, minsize=590)
         body.columnconfigure(1, weight=2, minsize=400)
         body.rowconfigure(0, weight=1)
-        left = ttk.Frame(body, padding=14)
+        left = ttk.Frame(body, padding=10)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
-        self._label(left, "运动控制", "Section.TLabel").pack(anchor="w", pady=(0, 12))
-        self.tabs = ttk.Notebook(left)
+        self.workspaces = ttk.Notebook(left, style="Flat.TNotebook")
+        self._navigation(left, self.workspaces, ("单电机控制", "扇扫与俯仰"), prominent=True)
+        self.workspaces.pack(fill="both", expand=True)
+        self.single_panel = ttk.Frame(self.workspaces, padding=(8, 8))
+        self.pose_tab = ttk.Frame(self.workspaces, padding=(8, 8))
+        self.workspaces.add(self.single_panel, text="单电机控制")
+        self.workspaces.add(self.pose_tab, text="双电机 · 扇扫 / 俯仰")
+        row = ttk.Frame(self.single_panel)
+        row.pack(fill="x", pady=(0, 8))
+        ttk.Label(row, text="操作电机").pack(side="left", padx=(0, 8))
+        self.motor_picker = ttk.Combobox(row, textvariable=self.motor_choice, state="readonly",
+            values=("电机1 · 左轴 · ID 1", "电机2 · 右轴 · ID 2"), width=22)
+        self.motor_picker.pack(side="left")
+        self.motor_picker.bind("<<ComboboxSelected>>", self._motor_changed)
+        self.enable_button = self._button(row, "使能所选电机", self._enable, managed=False)
+        self.enable_button.pack(side="right")
+        self.tabs = ttk.Notebook(self.single_panel, style="Flat.TNotebook")
+        self._navigation(self.single_panel, self.tabs, ("角度定位 / 点动", "连续旋转"))
         self.tabs.pack(fill="both", expand=True)
-        self.position_tab = ttk.Frame(self.tabs, padding=(12, 10))
-        self.continuous_tab = ttk.Frame(self.tabs, padding=(12, 10))
-        self.tabs.add(self.position_tab, text="角度定位")
+        self.position_tab = ttk.Frame(self.tabs, padding=(8, 8))
+        self.continuous_tab = ttk.Frame(self.tabs, padding=(8, 8))
+        self.tabs.add(self.position_tab, text="角度定位 / 点动")
         self.tabs.add(self.continuous_tab, text="连续旋转")
         self._position_layout()
         self._continuous_layout()
+        self._pose_layout()
         self.tabs.bind("<<NotebookTabChanged>>", self._mode_changed)
+        self.workspaces.bind("<<NotebookTabChanged>>", self._workspace_changed)
 
         right = ttk.Frame(body, padding=14)
         right.grid(row=0, column=1, sticky="nsew")
-        self._label(right, "电机信息", "Section.TLabel").pack(anchor="w")
-        self.dial = tk.Canvas(right, height=80, bg=WHITE, highlightthickness=0)
+        ttk.Label(right, textvariable=self.status_title, style="Section.TLabel").pack(anchor="w")
+        ttk.Label(right, textvariable=self.dual_info, wraplength=350, style="Muted.TLabel").pack(fill="x", pady=(6, 0))
+        self.single_feedback = ttk.Frame(right)
+        self.single_feedback.pack(fill="both", expand=True)
+        detail = self.single_feedback
+        self.dual_feedback = ttk.Frame(right)
+        self.motor_cards = []
+        for title in ("左轴 · ID 1", "右轴 · ID 2"):
+            card = ttk.LabelFrame(self.dual_feedback, text=title, padding=(12, 8))
+            card.pack(fill="x", pady=(8, 0))
+            position, status, target = tk.StringVar(value="—"), tk.StringVar(value="离线"), tk.StringVar(value="目标 —")
+            row = ttk.Frame(card)
+            row.pack(fill="x")
+            ttk.Label(row, textvariable=position, font=(self.font_family, 26, "bold"), foreground=BLUE).pack(side="left")
+            ttk.Label(row, textvariable=status, style="Muted.TLabel").pack(side="right")
+            ttk.Label(card, textvariable=target, style="Muted.TLabel").pack(anchor="w")
+            self.motor_cards.append((position, status, target))
+        ttk.Label(self.dual_feedback, textvariable=self.limit_status, style="Muted.TLabel", wraplength=340).pack(fill="x", pady=8)
+        guide = ttk.LabelFrame(right, text="下一步", padding=(10, 7))
+        guide.pack(side="bottom", fill="x", pady=(8, 0))
+        ttk.Label(guide, textvariable=self.workflow_text, wraplength=330).pack(anchor="w")
+        ttk.Label(guide, textvariable=self.link_text, style="Muted.TLabel", wraplength=330).pack(anchor="w", pady=(4, 0))
+        self.dial = tk.Canvas(detail, height=80, bg=WHITE, highlightthickness=0)
         self.dial.pack(fill="x", pady=(6, 0))
-        ttk.Label(right, textvariable=self.angle, font=(self.font_family, 24, "bold"), foreground=BLUE).pack()
-        self._label(right, "累计角度", "Muted.TLabel").pack(pady=(0, 9))
-        rows = ttk.Frame(right)
+        ttk.Label(detail, textvariable=self.angle, font=(self.font_family, 24, "bold"), foreground=BLUE).pack()
+        ttk.Label(detail, textvariable=self.angle_caption, style="Muted.TLabel").pack(pady=(0, 9))
+        rows = ttk.Frame(detail)
         rows.pack(fill="x")
-        for key, label in (("motion", "运行状态"), ("enabled", "电机使能"), ("target", "目标角度"),
+        for key, label in (("motion", "运行状态"), ("enabled", "电机使能"), ("target", "目标累计角度"),
                            ("speed", "当前转速"), ("remaining", "剩余运行时间"), ("voltage", "电压 / 电流")):
             row = ttk.Frame(rows)
             row.pack(fill="x", pady=1)
             self._label(row, label, "Muted.TLabel").pack(side="left")
             self.info[key] = tk.StringVar(value="—")
             ttk.Label(row, textvariable=self.info[key]).pack(side="right")
-        ttk.Separator(right).pack(fill="x", pady=8)
+        ttk.Separator(detail).pack(fill="x", pady=8)
         self.info["origin"] = tk.StringVar()
-        ttk.Label(right, textvariable=self.info["origin"], style="Muted.TLabel", wraplength=340).pack(anchor="w")
+        ttk.Label(detail, textvariable=self.info["origin"], style="Muted.TLabel", wraplength=340).pack(anchor="w")
 
-        notice = ttk.Frame(footer, padding=(12, 9))
-        notice.pack(fill="x", pady=(8, 6))
+        notice = ttk.Frame(footer, padding=(12, 6))
+        notice.pack(fill="x", pady=(5, 4))
+        line = ttk.Frame(notice)
+        line.pack(fill="x")
+        ttk.Label(line, textvariable=self.activity_text, font=(self.font_family, 11, "bold")).pack(side="left")
+        ttk.Label(line, textvariable=self.elapsed_text, style="Muted.TLabel").pack(side="right")
+        progress_track = ttk.Frame(notice, height=5)
+        progress_track.pack(fill="x", pady=(5, 4))
+        progress_track.pack_propagate(False)
+        self.progress = ttk.Progressbar(progress_track, style="Activity.Horizontal.TProgressbar", mode="indeterminate", maximum=100)
+        self.progress.pack(fill="both", expand=True)
         self.notice_label = ttk.Label(notice, textvariable=self.notice, foreground=BLUE, wraplength=1040)
         self.notice_label.pack(anchor="w")
-        log_header = tk.Frame(footer, bg=BG)
-        log_header.pack(fill="x", pady=(0, 5))
-        tk.Label(log_header, text="操作日志", bg=BG, fg=MUTED, font=(self.font_family, 9)).pack(side="left")
         log_frame = ttk.Frame(footer)
         log_frame.pack(fill="x")
-        self.logs = tk.Text(log_frame, height=2, wrap="word", bg="#EAF0F8", fg=MUTED, relief="flat",
+        ttk.Label(log_frame, text="操作日志", style="Muted.TLabel").pack(side="left", padx=8)
+        self.logs = tk.Text(log_frame, height=1, wrap="word", bg="#EAF0F8", fg=MUTED, relief="flat",
                             padx=10, pady=7, font=(self.font_family, 9), state="disabled")
         self.logs.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(log_frame, command=self.logs.yview)
         scroll.pack(side="right", fill="y")
         self.logs.configure(yscrollcommand=scroll.set)
 
+    def _navigation(self, parent, notebook, labels, *, prominent=False):
+        row = tk.Frame(parent, bg="#E9EFF8", padx=3, pady=3)
+        row.pack(fill="x", pady=(0, 6 if prominent else 4))
+        buttons = []
+        for index, label in enumerate(labels):
+            def select(i=index):
+                notebook.select(i)
+                self._refresh()
+            button = ttk.Button(row, text=label, command=select, cursor="hand2",
+                                style="NavLarge.TButton" if prominent else "Nav.TButton")
+            button.pack(side="left", fill="x", expand=True, padx=1)
+            buttons.append(button)
+        self.navigation.append((notebook, buttons, prominent))
+
+    def _activity(self, states, busy, dual):
+        now = time.monotonic()
+        connected = all(s.connected for s in states)
+        error = next((s.error for s in states if s.error), None)
+        if busy and not error:
+            if self._busy_since is None:
+                self._busy_since = now
+                self._move_starts = [s.position_deg for s in states]
+            self.elapsed_text.set(f"已用 {now-self._busy_since:.1f} 秒")
+            phases = {s.motion for s in states}
+            if phases & {"connecting", "pending", "closing"}:
+                headline = getattr(self.controller.backend,"activity","正在处理指令")
+            elif "stopping" in phases:
+                headline = "正在停止 · 等待两轴停稳"
+            elif self._scanning:
+                headline = f"往复扫描中 · 第 {max(1,self._scan_total-len(self.pose.sequence))} / {self._scan_total} 段"
+            elif self.pose.sequence:
+                headline = f"双轴定位中 · 剩余 {len(self.pose.sequence)} 段"
+            else:
+                headline = "运动执行中 · 正在读取位置反馈"
+            self.activity_text.set(headline)
+            mode = "indeterminate"
+            progress = []
+            if not self._scanning and not self.pose.sequence and phases <= {"positioning", "continuous", "idle"}:
+                for initial, state in zip(self._move_starts, states):
+                    if state.target_deg is not None and abs(state.target_deg-initial) > 0.001:
+                        progress.append(max(0,min(99,100*abs(state.position_deg-initial)/abs(state.target_deg-initial))))
+                if progress:
+                    mode = "determinate"
+            if mode != self._progress_mode:
+                self.progress.stop()
+                self.progress.configure(mode=mode)
+                if mode == "indeterminate":
+                    self.progress.start(15)
+                self._progress_mode = mode
+            if mode == "determinate":
+                self.progress.configure(value=min(progress))
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate", value=0)
+            self._progress_mode = "determinate"
+            self.activity_text.set("操作中断 · 请查看提示" if error else "设备已就绪" if connected else "连接设备，开始控制")
+            if self._busy_since is not None:
+                self.elapsed_text.set(f"本次用时 {now-self._busy_since:.1f} 秒")
+            elif not connected:
+                self.elapsed_text.set("")
+            self._busy_since = None
+            self._move_starts = None
+        if not connected:
+            guide = "选择连接方式和设备，然后点击“连接”。"
+        elif busy:
+            guide = "当前操作正在执行，可随时点击“全部停止”或按 Esc。"
+        elif dual and not all(s.enabled for s in states):
+            guide = "先使能两台电机，再设置目标或扫描参数。"
+        elif dual and self.pose.center is None:
+            guide = "进入“标定与范围”，将当前机械中心记录为零点。"
+        elif dual:
+            guide = "修改目标或扫描参数，点击蓝色按钮执行。"
+        elif not self.controller.snapshot().enabled:
+            guide = "使能所选电机后，即可点动、定位或连续旋转。"
+        else:
+            guide = f"当前只控制 ID {self.controller.backend.selected+1}；修改参数后点击执行。"
+        self.workflow_text.set(guide)
+        backend = self.controller.backend
+        transport = getattr(backend,"transport_name","本地模拟")
+        latency = getattr(getattr(backend,"_serial",None),"last_exchange_ms",None)
+        self.link_text.set(f"{transport} · 最近通信 {latency:.0f} ms" if latency is not None else transport)
+
     def _field(self, parent: tk.Widget, label: str, variable: tk.StringVar, unit: str) -> ttk.Frame:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=(0, 6))
         self._label(row, label, width=12).pack(side="left")
-        ttk.Entry(row, textvariable=variable, width=13).pack(side="left", padx=(0, 8))
+        entry = ttk.Entry(row, textvariable=variable, width=11, style="Input.TEntry")
+        entry.pack(side="left", padx=(0, 8))
+        self.motion_inputs.append(entry)
         self._label(row, unit, "Muted.TLabel").pack(side="left")
         return row
 
     def _position_layout(self) -> None:
         parent = self.position_tab
-        self._field(parent, "单步角度", self.step, "°")
-        buttons = ttk.Frame(parent)
-        buttons.pack(fill="x", pady=(0, 10))
+        row = self._field(parent, "运动转速", self.position_rpm, "RPM · 本页所有定位动作")
+        self._button(row, f"默认 {self.default_rpm}", lambda: self._default(self.position_rpm), managed=False).pack(side="right")
+        step_box = ttk.LabelFrame(parent, text="点动 · 按设定步长转动", padding=(8, 6))
+        step_box.pack(fill="x", pady=(0, 8))
+        buttons = ttk.Frame(step_box)
+        buttons.pack(fill="x")
+        ttk.Label(buttons, text="步长 °").pack(side="left", padx=(0, 6))
+        entry = ttk.Entry(buttons, textvariable=self.step, width=7, style="Input.TEntry")
+        entry.pack(side="left", padx=(0, 8))
+        self.motion_inputs.append(entry)
         self.reverse_button = self._button(buttons, "↶  逆时针一步", lambda: self._jog(1))
-        self.reverse_button.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.reverse_button.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.forward_button = self._button(buttons, "↷  顺时针一步", lambda: self._jog(-1), primary=True)
         self.forward_button.pack(side="left", fill="x", expand=True)
-        row = self._field(parent, "目标角度", self.target, "°")
-        self.goto_button = self._button(row, "转到指定角度", self._goto)
+        target_box = ttk.LabelFrame(parent, text="角度定位 · 输入目标后执行", padding=(8, 6))
+        target_box.pack(fill="x", pady=(0, 8))
+        row = self._field(target_box, "目标累计角度", self.target, "°")
+        self.goto_button = self._button(row, "执行定位", self._goto, primary=True)
         self.goto_button.pack(side="right")
-        row = self._field(parent, "定位转速", self.position_rpm, "RPM")
-        self._button(row, f"默认 {self.default_rpm} RPM", lambda: self._default(self.position_rpm), managed=False).pack(side="right")
-        ttk.Separator(parent).pack(fill="x", pady=(3, 8))
         row = ttk.Frame(parent)
         row.pack(fill="x")
-        self.zero_button = self._button(row, "复位 · 返回 0°", self._zero)
+        self.zero_button = self._button(row, "就近回零", self._zero)
         self.zero_button.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.origin_button = self._button(row, "保存为开机零点", self._save_startup_origin)
         self.origin_button.pack(side="left", fill="x", expand=True)
+
+    def _motor_changed(self, _event=None):
+        self.controller.armed = None
+        self.controller.backend.selected = self.motor_picker.current()
+        self.last_error = None
+        self._refresh()
+
+    def _pose_layout(self):
+        parent = self.pose_tab
+        self.pose_actions = []
+        self.pose_feedback = tk.StringVar(value="尚未标定机械中心")
+        top = ttk.Frame(parent)
+        top.pack(fill="x", pady=(0, 6))
+        ttk.Label(top, text="同时控制 ID 1 + ID 2", foreground=BLUE).pack(side="left")
+        self.enable_all_button = self._button(top, "使能两台电机", lambda: self._perform(self.controller.backend.enable_all, "双轴使能已提交"), managed=False)
+        self.enable_all_button.pack(side="right")
+        self.pose_tabs = ttk.Notebook(parent, style="Flat.TNotebook")
+        self._navigation(parent, self.pose_tabs, ("目标定位", "往复扫描", "标定与范围"))
+        self.pose_tabs.pack(fill="both", expand=True)
+        self.pose_target_tab = ttk.Frame(self.pose_tabs, padding=8)
+        self.pose_scan_tab = ttk.Frame(self.pose_tabs, padding=8)
+        self.pose_setup_tab = ttk.Frame(self.pose_tabs, padding=8)
+        for page, label in ((self.pose_target_tab, "目标定位"), (self.pose_scan_tab, "往复扫描"), (self.pose_setup_tab, "标定与范围")):
+            self.pose_tabs.add(page, text=label)
+        parent = self.pose_target_tab
+        ttk.Label(parent, text="改下方目标值 → 点击执行。首次使用先到“标定与范围”。", style="Muted.TLabel").pack(anchor="w", pady=(0, 8))
+        self._field(parent, "目标扇扫 α", self.alpha, "° · 共同命令角")
+        self._field(parent, "目标俯仰 β", self.beta, "° · 差动命令角")
+        self._field(parent, "定位转速", self.pose_rpm, "RPM")
+        ttk.Label(parent, textvariable=self.pose_preview, foreground=BLUE).pack(anchor="w", pady=(0, 6))
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        self.pose_move_button = self._button(row, "执行双电机定位", lambda: self._perform(lambda: self.pose.move(self.alpha.get(), self.beta.get(), self.pose_rpm.get()), "双电机定位已提交"), managed=False, primary=True)
+        self.pose_move_button.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.pose_zero_button = self._button(row, "双轴回到中心", lambda: self._perform(lambda: self.pose.move(0, 0, self.pose_rpm.get()), "双轴回到中心"), managed=False)
+        self.pose_zero_button.pack(side="left", fill="x", expand=True)
+        self.pose_actions.extend((self.pose_move_button, self.pose_zero_button))
+        ttk.Label(parent, text="纯扇扫：只改 α，β 设 0；纯俯仰：α 设 0，只改 β。", style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        parent = self.pose_scan_tab
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(0, 6))
+        ttk.Label(row, text="扫描方向", width=12).pack(side="left")
+        ttk.Combobox(row, textvariable=self.sweep_axis, values=("扇扫 α", "俯仰 β"), state="readonly", width=16).pack(side="left")
+        self._field(parent, "往复半幅 ±", self.amplitude, "° · 两端为 −幅度 / +幅度")
+        row = self._field(parent, "", self.fixed, "° · 扫描时保持此值")
+        row.winfo_children()[0].configure(textvariable=self.fixed_label)
+        row = self._field(parent, "往复次数", self.cycles, "次")
+        ttk.Label(row, text="转速 RPM").pack(side="left", padx=(10, 5))
+        entry = ttk.Entry(row, textvariable=self.sweep_rpm, width=5, style="Input.TEntry")
+        entry.pack(side="left")
+        self.motion_inputs.append(entry)
+        ttk.Label(parent, textvariable=self.sweep_preview, foreground=BLUE, wraplength=490).pack(anchor="w", pady=(0, 6))
+        self.pose_scan_button = self._button(parent, "开始双电机往复扫描", self._start_sweep, managed=False, primary=True)
+        self.pose_scan_button.pack(fill="x")
+        self.pose_actions.append(self.pose_scan_button)
+        parent = self.pose_setup_tab
+        ttk.Label(parent, text="先用单电机控制调到机械中心，再记录当前位置和方向。", style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
+        row = ttk.Frame(parent)
+        row.pack(fill="x")
+        for label, var in (("左轴正向", self.left_sign), ("右轴正向", self.right_sign)):
+            ttk.Label(row, text=label).pack(side="left")
+            ttk.Combobox(row, textvariable=var, values=("+1", "-1"), width=3, state="readonly").pack(side="left", padx=5)
+        self.calibrate_button = self._button(row, "标定机械中心", self._calibrate_pose, managed=False)
+        self.calibrate_button.pack(side="right")
+        self.pose_actions.append(self.calibrate_button)
+        box = ttk.LabelFrame(parent, text="实验软件限位（可选，按测量结果填写）", padding=8)
+        box.pack(fill="x", pady=(8, 4))
+        ttk.Checkbutton(box, text="启用下方软件限位", variable=self.use_limits).pack(anchor="w")
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=4)
+        for label, variable in (("扇扫 α ±", self.alpha_limit), ("俯仰 β ±", self.beta_limit)):
+            ttk.Label(row, text=label).pack(side="left", padx=(0, 5))
+            ttk.Entry(row, textvariable=variable, width=6, style="Input.TEntry").pack(side="left")
+            ttk.Label(row, text="°").pack(side="left", padx=(2, 8))
+        self.apply_limits_button = self._button(box, "应用实验范围设置", self._apply_limits, managed=False)
+        self.apply_limits_button.pack(fill="x")
+        ttk.Label(parent, textvariable=self.limit_status, style="Muted.TLabel", wraplength=490).pack(anchor="w")
+        ttk.Label(self.pose_tab, textvariable=self.pose_feedback, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+
+    def _parameter_hints(self, *_args):
+        try:
+            a = number(self.alpha.get(), "α", -360000, 360000)
+            b = number(self.beta.get(), "β", -360000, 360000)
+            self.pose_preview.set(f"中心相对电机命令：左轴 {a+b:+g}°，右轴 {a-b:+g}°（标定方向前）")
+        except ValueError:
+            self.pose_preview.set("输入有效的扇扫 α 和俯仰 β 后显示电机命令")
+        name = "俯仰 β" if self.sweep_axis.get() == "扇扫 α" else "扇扫 α"
+        self.fixed_label.set("固定" + name)
+        self.sweep_preview.set(f"扫描：−{self.amplitude.get()}° → +{self.amplitude.get()}° → −{self.amplitude.get()}°，共 {self.cycles.get()} 次；完成后扫描轴归中。")
+
+    def _start_sweep(self):
+        if self._perform(lambda: self.pose.sweep("alpha" if self.sweep_axis.get() == "扇扫 α" else "beta", self.amplitude.get(), self.fixed.get(), self.sweep_rpm.get(), self.cycles.get()), "双电机往复扫描已启动"):
+            self._scanning = True
+            self._scan_total = len(self.pose.sequence)+1
+            self._refresh()
+
+    def _apply_limits(self):
+        def apply():
+            self.pose.configure_limits(self.alpha_limit.get(), self.beta_limit.get()) if self.use_limits.get() else self.pose.configure_limits()
+            limits = self.pose.limits
+            self.limit_status.set(f"已应用软件限位：α ±{limits[0]:g}°，β ±{limits[1]:g}°（实验设置）" if limits else "未启用软件限位；机械范围待实验测量")
+        self._perform(apply, "实验范围设置已应用")
+
+    def _workspace_changed(self, _event=None):
+        dual = self.workspaces.index(self.workspaces.select()) == 1
+        # Workspace changes cancel queued segments and disarm single-axis starts.
+        self.pose.sequence = []
+        self._scanning = False
+        self.controller.stop()
+        if dual:
+            self.single_feedback.pack_forget()
+            self.dual_feedback.pack(fill="both", expand=True)
+        else:
+            self.dual_feedback.pack_forget()
+            self.single_feedback.pack(fill="both", expand=True)
+        self._mode_changed()
+        self._refresh()
+
+    def _calibrate_pose(self):
+        self._perform(lambda: self.pose.calibrate(int(self.left_sign.get()), int(self.right_sign.get())), "已记录机械中心和方向；α/β为电机命令角")
 
     def _continuous_layout(self) -> None:
         parent = self.continuous_tab
@@ -289,7 +608,7 @@ class MotorApp(tk.Tk):
         self.logs.insert("end", f"{time.strftime('%H:%M:%S')}  {text}\n")
         if int(self.logs.index("end-1c").split(".")[0]) > 300:
             self.logs.delete("1.0", "2.0")
-        self.logs.see("end")
+        self.logs.see("end-2c")
         self.logs.configure(state="disabled")
 
     def _perform(self, action, success: str) -> bool:
@@ -389,18 +708,24 @@ class MotorApp(tk.Tk):
         self._refresh()
 
     def _connect(self) -> None:
+        self._scanning = False
         if self.controller.snapshot().connected:
-            self._perform(self.controller.disconnect, "已断开" if isinstance(self.controller.backend, DemoBackend) else "正在断开")
+            self._perform(self.controller.disconnect, "已断开" if isinstance(self.controller.backend, DualDemoBackend) else "正在断开")
         else:
             def connect():
                 if self.connection_mode.get() == "ST-Link 连接":
-                    backend = StLinkBackend(self.port.get(), self.address.get(), self.pulses.get(), self.elf_path.get())
-                    self.controller.select_backend(backend)
+                    probe, elf = self.port.get(), self.elf_path.get()
+                    backend = DualSerialBackend(probe, pulses_per_turn=self.pulses.get(),
+                        serial_factory=lambda *_a, **_k: BridgeTransport(probe, elf, progress=lambda message: setattr(backend, "activity", message)))
                 elif self.connection_mode.get() == "串口连接":
-                    backend = SerialBackend(self.port.get(), self.baudrate.get(), self.address.get(), self.pulses.get())
-                    self.controller.select_backend(backend)
-                elif not isinstance(self.controller.backend, DemoBackend):
-                    self.controller.select_backend(DemoBackend())
+                    backend = DualSerialBackend(self.port.get(), self.baudrate.get(), self.pulses.get())
+                else:
+                    backend = DualDemoBackend()
+                backend.selected = self.motor_picker.current()
+                self.controller.select_backend(backend)
+                previous_limits = self.pose.limits
+                self.pose = PoseControl(backend)
+                self.pose.limits = previous_limits
                 self.last_error = None
                 self.controller.connect()
             self._perform(connect, "模拟设备已连接" if self.connection_mode.get() == "模拟连接" else "正在连接设备")
@@ -418,14 +743,16 @@ class MotorApp(tk.Tk):
                       f"定位至 {self.target.get()}° · {self.position_rpm.get()} RPM")
 
     def _zero(self) -> None:
-        self._perform(lambda: self.controller.return_zero(self.position_rpm.get()), "返回 0°")
+        self._perform(lambda: self.controller.return_zero(self.position_rpm.get()), "所选电机就近回零已提交")
 
     def _save_startup_origin(self) -> None:
+        self.pose.center = None
         self._saving_startup_origin = True
         if not self._perform(self.controller.save_startup_origin, "正在保存开机零点"):
             self._saving_startup_origin = False
 
     def _origin(self) -> None:
+        self.pose.center = None
         if messagebox.askyesno("设置坐标零点", "将当前位置设为 0°？", parent=self):
             self._perform(self.controller.set_origin, "零点设置已提交")
 
@@ -450,10 +777,14 @@ class MotorApp(tk.Tk):
                       f"连续旋转已启动 · {self.continuous_rpm.get()} RPM · 最长 {self.duration.get()} 秒")
 
     def _stop(self) -> None:
-        self._perform(self.controller.stop, "停止请求已提交")
+        self._scanning = False
+        self.pose.sequence = []
+        self._perform(self.controller.stop, "两台电机停止请求已提交")
 
     def _mode_changed(self, _event=None) -> None:
-        mode = "position" if self.tabs.index(self.tabs.select()) == 0 else "continuous"
+        if self.pose.sequence:
+            self.pose.stop()
+        mode = "continuous" if self.workspaces.index(self.workspaces.select()) == 0 and self.tabs.index(self.tabs.select()) == 1 else "position"
         if mode != self.controller.mode:
             self._perform(lambda: self.controller.change_mode(mode),
                           f"已切换到{'角度定位' if mode == 'position' else '连续旋转'}")
@@ -474,13 +805,53 @@ class MotorApp(tk.Tk):
 
     def _refresh(self) -> None:
         state = self.controller.snapshot()
-        ready = state.connected and state.enabled and state.motion == "idle"
+        states = [axis.snapshot() for axis in self.controller.backend.axes]
+        busy = bool(self.pose.sequence) or any(s.motion != "idle" for s in states)
+        dual = self.workspaces.index(self.workspaces.select()) == 1
+        self._activity(states, busy, dual)
+        for notebook, buttons, prominent in self.navigation:
+            selected = notebook.index(notebook.select())
+            for index, button in enumerate(buttons):
+                active = index == selected
+                style = ("NavSelectedLarge.TButton" if active else "NavLarge.TButton") if prominent else ("NavSelected.TButton" if active else "Nav.TButton")
+                button.configure(style=style, state="disabled" if busy and prominent else "normal")
+        for entry in self.motion_inputs:
+            entry.configure(state="disabled" if busy else "normal")
+        for axis_state, (position, status, target) in zip(states, self.motor_cards):
+            position.set(f"{axis_state.position_deg:+.3f}°" if axis_state.connected else "—")
+            status.set(("已使能" if axis_state.enabled else "未使能") if axis_state.connected else "离线")
+            target.set(f"目标 {axis_state.target_deg:+.3f}°" if axis_state.connected and axis_state.target_deg is not None else "目标 —")
+        self.status_title.set("双电机反馈 · ID 1 + ID 2" if dual else f"单电机反馈 · ID {self.controller.backend.selected+1}")
+        self.motor_picker.configure(state="disabled" if busy else "readonly")
+        self.apply_limits_button.configure(state="disabled" if busy else "normal")
+        motor_lines = []
+        for i, axis_state in enumerate(states):
+            title = f"电机 {i+1} · {'左轴' if i == 0 else '右轴'}"
+            if not axis_state.connected:
+                motor_lines.append(title + "：离线")
+                continue
+            target = f"{axis_state.target_deg:+.3f}°" if axis_state.target_deg is not None else "—"
+            motion = {"idle": "待机", "positioning": "定位中", "pending": "处理中", "continuous": "旋转中", "stopping": "停止中"}.get(axis_state.motion, "处理中")
+            motor_lines.append(f"{title}\n当前位置：{axis_state.position_deg:+.3f}°\n目标角度：{target}\n状态：{motion} · {'使能' if axis_state.enabled else '失能'}")
+        self.dual_status.set("\n\n".join(motor_lines) + "\n\n" + self.limit_status.get())
+        self.dual_info.set("  |  ".join(f"ID {i+1}: {s.position_deg:+.3f}° · {'使能' if s.enabled else '失能'}" if s.connected else f"ID {i+1}: 离线" for i,s in enumerate(states)))
+        coords = self.pose.coordinates() if all(s.connected for s in states) else None
+        self.pose_feedback.set(f"反馈命令坐标 α={coords[0]:+.3f}°  β={coords[1]:+.3f}°" if coords else "离线：无实时姿态反馈" if not all(s.connected for s in states) else "尚未标定机械中心")
+        self.enable_all_button.configure(state="normal" if all(s.connected for s in states) and not busy else "disabled")
+        dual_ready = all(s.connected and s.enabled and not s.error for s in states) and not busy
+        for button in self.pose_actions:
+            button.configure(state="normal" if dual_ready else "disabled")
+        ready = state.connected and state.enabled and state.motion == "idle" and not busy
         for button in self.actions:
             button.configure(state="normal" if ready else "disabled")
-        self.origin_button.configure(state="normal" if state.connected and state.motion == "idle" else "disabled")
-        self.enable_button.configure(state="normal" if state.connected and state.motion == "idle" else "disabled", text="失能电机" if state.enabled else "使能电机")
+        self.origin_button.configure(state="normal" if state.connected and state.motion == "idle" and not busy else "disabled")
+        self.enable_button.configure(state="normal" if state.connected and state.motion == "idle" and not busy else "disabled", text="失能所选电机" if state.enabled else "使能所选电机")
         busy_connection = state.motion in ("connecting", "closing")
         self.connect_button.configure(text="断开" if state.connected else "连接", state="disabled" if busy_connection else "normal")
+        if state.connected:
+            self.settings_row.pack_forget()
+        elif not self.settings_row.winfo_manager():
+            self.settings_row.pack(fill="x", pady=(6, 0))
         locked = state.connected or busy_connection
         self.mode_picker.configure(state="disabled" if locked else "readonly")
         serial_locked = locked or self.connection_mode.get() == "模拟连接"
@@ -489,7 +860,9 @@ class MotorApp(tk.Tk):
         self.scan_button.configure(state="disabled" if serial_locked or self.probe_scanning else "normal")
         self.elf_button.configure(state="disabled" if locked else "normal")
         self.connection.set("正在连接" if state.motion == "connecting" else "正在断开" if state.motion == "closing" else "已连接" if state.connected else "未连接")
-        self.angle.set(f"{state.position_deg:+.3f}°" if state.connected else "—")
+        phase = round(state.position_deg % 360.0, 3) % 360.0
+        self.angle.set(f"{phase:.3f}°" if state.connected else "—")
+        self.angle_caption.set(f"单圈角度 · 累计 {state.position_deg:+.3f}°" if state.connected else "单圈角度 · 累计角度 —")
         motion_text = {"idle": "待机", "positioning": "角度定位中", "continuous": "连续旋转中", "confirming": "确认到位中", "fault": "位置反馈异常", "saving_origin": "保存开机零点中", "pending": "指令处理中", "stopping": "正在停止", "connecting": "正在连接", "closing": "正在断开"}[state.motion]
         self.info["motion"].set(motion_text if state.connected else "离线")
         self.info["enabled"].set(("已使能" if state.enabled else "未使能") if state.connected else "—")
@@ -512,6 +885,12 @@ class MotorApp(tk.Tk):
     def _advance(self) -> None:
         now = time.monotonic()
         self.controller.update(max(0, now - self.last_update))
+        try:
+            self.pose.update()
+        except (ValueError, RuntimeError) as exc:
+            self.notice.set(str(exc))
+            self.notice_label.configure(foreground=RED)
+            self._log(f"扫描已停止 · {exc}")
         self.last_update = now
         motion = self.controller.snapshot().motion
         state = self.controller.snapshot()
@@ -530,7 +909,12 @@ class MotorApp(tk.Tk):
             self.notice.set(state.error)
             self.notice_label.configure(foreground=RED)
             self._log(state.error)
-        if self.last_motion in ("positioning", "continuous", "confirming", "stopping") and motion == "idle" and state.connected and not state.error:
+        all_idle = all(axis.snapshot().motion == "idle" for axis in self.controller.backend.axes) and not self.pose.sequence
+        if self._scanning and all_idle and state.connected and not state.error:
+            self._scanning = False
+            self.notice.set("往复扫描已完成")
+            self._log("往复扫描已完成")
+        elif self.last_motion in ("positioning", "continuous", "confirming", "stopping") and motion == "idle" and all_idle and state.connected and not state.error:
             message = "已到达目标" if self.last_motion in ("positioning", "confirming") else "运行已结束"
             self.notice.set(message)
             self.notice_label.configure(foreground=BLUE)

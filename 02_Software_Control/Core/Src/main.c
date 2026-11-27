@@ -27,6 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "zdt_x42s.h"
 #include "motor_app.h"
+#include "motor_bridge.h"
 #include "keycontrol.h"
 
 /* USER CODE END Includes */
@@ -229,6 +230,18 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     RS485_Proc();
+    /* Reject legacy Watch writes during the exclusive desktop session;
+     * never leave a queued motion to execute after disconnect or K0. */
+    if (s_bridge.active && s_debug.request != 0U) {
+        s_debug.request = 0U;
+        s_debug.arm = 0U;
+        s_debug.result = RS485_BUSY;
+    }
+    MOTOR_AppDebug_t owner;
+    MOTOR_AppGetDebug(&owner);
+    if (MOTOR_BridgeProc(owner.active || s_debug.request != 0U, (s_bridge.active ? (KEY_TakePress() & KEY_EVENT_K0) != 0U : false))) {
+        continue;
+    }
     ZDT_X42S_Proc();
     Requests_Proc(); /* Keys and Watch share a single application owner. */
     MOTOR_AppProc();

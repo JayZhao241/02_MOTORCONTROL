@@ -1,7 +1,7 @@
 import math
 import unittest
 
-from desktop.controller import Controller, firmware_default_rpm
+from desktop.controller import Controller, firmware_default_rpm, nearest_zero_target
 
 
 class ControllerTests(unittest.TestCase):
@@ -48,7 +48,37 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.motor.snapshot().position_deg, 450)
         self.motor.return_zero(5)
         self.motor.update(20)
-        self.assertEqual(self.motor.snapshot().position_deg, 0)
+        self.assertEqual(self.motor.snapshot().position_deg, 360)
+
+    def test_nearest_zero_for_multiple_turns_and_both_directions(self):
+        for current, expected in ((730,720),(-730,-720),(710,720),(-710,-720),
+                                  (450,360),(-450,-360),(180,0),(-180,0),
+                                  (540,360),(-540,-360),(1080,1080),(-1080,-1080),
+                                  (360180,360000),(360181,360360)):
+            with self.subTest(current=current):
+                self.motor.backend.position = current
+                self.motor.return_zero(5)
+                self.assertEqual(self.motor.snapshot().target_deg,expected)
+                self.assertLessEqual(abs(expected-current),180)
+                self.motor.update(10)
+                self.assertEqual(self.motor.snapshot().position_deg,expected)
+
+    def test_nearest_zero_keeps_origin_and_manual_cumulative_positioning(self):
+        self.motor.backend.position = 730
+        self.motor.return_zero(5); self.motor.update(1)
+        self.assertEqual(self.motor.snapshot().position_deg,720)
+        self.assertEqual(self.motor.snapshot().origin,"模拟零点")
+        self.motor.move_to(0,5); self.motor.update(30)
+        self.assertEqual(self.motor.snapshot().position_deg,0)
+
+    def test_nearest_zero_rejects_invalid_feedback_and_speed(self):
+        for position in (math.nan,math.inf,-math.inf):
+            with self.assertRaises(ValueError): nearest_zero_target(position)
+        self.motor.backend.position = 730
+        with self.assertRaises(ValueError): self.motor.return_zero(0)
+        self.assertEqual(self.motor.snapshot().motion,"idle")
+        self.motor.change_mode("continuous")
+        with self.assertRaises(ValueError): self.motor.return_zero(5)
 
     def test_setting_origin_changes_coordinate_without_motion(self):
         self.motor.move_to(90, 5)

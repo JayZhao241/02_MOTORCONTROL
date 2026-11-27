@@ -26,6 +26,21 @@ def number(value: object, label: str, low: float, high: float) -> float:
     return result
 
 
+def nearest_zero_target(position: float) -> float:
+    """Nearest equivalent zero in the existing multi-turn coordinate system.
+
+    Keep the turn count and saved origin intact. At exactly half a turn, prefer
+    the equivalent zero whose cumulative magnitude is smaller.
+    """
+    if not math.isfinite(position):
+        raise ValueError("当前位置反馈无效，无法就近回零")
+    phase = math.fmod(position, 360.0)
+    if abs(phase) > 180.0:
+        phase -= math.copysign(360.0, phase)
+    target = position-phase
+    return 0.0 if target == 0 else target
+
+
 @dataclass(frozen=True)
 class Snapshot:
     connected: bool
@@ -205,7 +220,15 @@ class Controller:
         self.move_to(state.position_deg + direction * degrees, rpm)
 
     def return_zero(self, rpm: object) -> None:
-        self.move_to(0.0, rpm)
+        if self.mode != "position":
+            raise ValueError("请切换到角度定位模式")
+        state = self._ready()
+        target = nearest_zero_target(state.position_deg)
+        speed = self._rpm(rpm)
+        self.armed = None
+        # A computed equivalent zero can exceed the manual target entry range
+        # after long continuous rotation; its relative move is still <=180°.
+        self.backend.move_to(target, speed)
 
     def set_origin(self) -> None:
         state = self.backend.snapshot()

@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import json
+from pathlib import Path
 import queue
 import threading
 import time
@@ -39,6 +41,13 @@ def serial_ports() -> list[str]:
     return [port.device for port in serial_port_details()]
 
 
+class ReplyTimeout(RuntimeError):
+    """No matching motor response; not proof of a broken USB connection."""
+    def __init__(self, address, function, received):
+        self.address, self.function, self.received = address, function, bytes(received)
+        super().__init__(f"电机 ID {address} 回复超时：{function:02X}")
+
+
 class SerialBackend:
     def __init__(self, port: str, baudrate: object = 115200, address: object = 1,
                  pulses_per_turn: object = 3200, *, serial_factory=None) -> None:
@@ -61,6 +70,7 @@ class SerialBackend:
         self._motion = "idle"
         self._stable_since: float | None = None
         self._previous: tuple[float, float] | None = None
+        self._last_telemetry = 0.0
 
     @staticmethod
     def _integer(value, label, low, high) -> int:
@@ -133,16 +143,52 @@ class SerialBackend:
     def update(self, seconds: float) -> None:
         pass  # Serial I/O and its clock belong to the worker.
 
+    READ_FUNCTIONS = frozenset((0x1A,0x22,0x24,0x27,0x33,0x34,0x36,0x3A,0x3B,0x42))
+
+    def _record_timeout(self, error, retry):
+        try:
+            path = Path(__file__).resolve().parent / ".runtime" / "communication_errors.jsonl"
+            path.parent.mkdir(parents=True,exist_ok=True)
+            state = getattr(self._serial,"last_exchange_state",None)
+            diagnostics = {k:(v.hex() if isinstance(v,bytes) else v) for k,v in state.items()} if isinstance(state,dict) else None
+            with path.open("a",encoding="utf-8") as stream:
+                stream.write(json.dumps({"time":time.strftime("%Y-%m-%d %H:%M:%S"), "address":error.address,
+                    "function":f"{error.function:02X}","rx":error.received.hex(),"retry_read":retry,
+                    "motion":self._motion,"bridge":diagnostics},ensure_ascii=False)+"\n")
+        except OSError:
+            pass
+
     def _exchange(self, function: int, payload: bytes = b"", length: int = 4) -> bytes:
+        try:
+            return self._exchange_once(function,payload,length)
+        except ReplyTimeout as error:
+            retry = function in self.READ_FUNCTIONS and not self._exit.is_set() and self._commands.empty()
+            self._record_timeout(error,retry)
+            if not retry:
+                raise
+            if self._exit.wait(0.02):
+                raise error
+            # Only read-only queries get one bounded retry. Never replay FD,
+            # enable, stop, homing, or a persistent configuration write.
+            try:
+                return self._exchange_once(function,payload,length)
+            except ReplyTimeout as final:
+                self._record_timeout(final,False)
+                raise
+
+    def _exchange_once(self, function: int, payload: bytes = b"", length: int = 4) -> bytes:
         packet = bytes((self.address, function)) + payload + b"\x6b"
         if self._serial.write(packet) != len(packet):
             raise RuntimeError("串口发送不完整")
         deadline = time.monotonic() + (2 if function in (0x93, 0x4C) else 0.35)
         buffer = bytearray()
-        lengths = {0x22: 18, 0x93: 4, 0x4C: 4, 0x0A: 4, 0x3B: 4, 0x1A: 5, 0x24: 5, 0x27: 5, 0x33: 8, 0x34: 8, 0x36: 8,
+        received = bytearray()
+        lengths = {0x42: 33, 0x22: 18, 0x93: 4, 0x4C: 4, 0x0A: 4, 0x3B: 4, 0x1A: 5, 0x24: 5, 0x27: 5, 0x33: 8, 0x34: 8, 0x36: 8,
                    0x3A: 4, 0xF3: 4, 0xFD: 4, 0xFE: 4}
         while time.monotonic() < deadline:
-            buffer.extend(self._serial.read(64))
+            chunk = self._serial.read(64)
+            received.extend(chunk)
+            buffer.extend(chunk)
             while len(buffer) >= 2:
                 size = lengths.get(buffer[1])
                 if buffer[0] != self.address or size is None:
@@ -162,7 +208,7 @@ class SerialBackend:
                 if size != length:
                     raise RuntimeError("回复长度错误")
                 return frame
-        raise RuntimeError(f"电机回复超时：{function:02X}")
+        raise ReplyTimeout(self.address,function,received)
 
     def _position(self, function=0x36) -> float:
         frame = self._exchange(function, length=8)
@@ -176,7 +222,7 @@ class SerialBackend:
             raise RuntimeError("电机堵转或堵转保护")
         return status
 
-    def _execute(self, command, args) -> None:
+    def _execute(self, command, args, *, poll=True) -> None:
         if command == "stop":
             self._exchange(0xFE, b"\x98\x00")
             self._motion = "stopping"
@@ -236,7 +282,8 @@ class SerialBackend:
             if pulses == 0:
                 self._state = replace(self._state, target_deg=actual - self._offset)
                 self._motion = "idle"
-                self._poll()
+                if poll:
+                    self._poll()
                 return
             if pulses > 0xFFFFFFFF:
                 raise ValueError("目标位移超出脉冲范围")
@@ -251,13 +298,26 @@ class SerialBackend:
             self._motion = "continuous" if duration is not None else "positioning"
             now = time.monotonic()
             self._deadline = now + duration if duration is not None else None
-            self._move_deadline = now + abs(delta) / (rpm * 6) + 5
+            self._move_deadline = now + abs(delta) / (rpm * 6) + getattr(self, "feedback_grace_s", 5)
             self._stable_since = None
-        self._poll()
+        if poll:
+            self._poll()
 
-    def _poll(self) -> None:
+    def _poll(self, *, telemetry=True) -> None:
+        try:
+            self._poll_feedback(telemetry=telemetry)
+        except ReplyTimeout:
+            if not self._commands.empty():
+                return  # A queued stop must run before any further polling.
+            raise
+
+    def _poll_feedback(self, *, telemetry=True) -> None:
         status = self._status()
+        if not self._commands.empty():
+            return  # Yield at the frame boundary to an operator request.
         actual = self._position() - self._offset
+        if not self._commands.empty():
+            return
         now = time.monotonic()
         speed = 0.0
         if self._previous:
@@ -282,8 +342,14 @@ class SerialBackend:
                 raise RuntimeError("定位超时")
         if self._motion == "stopping" and self._stable_since and now - self._stable_since >= 0.6:
             self._motion = "idle"
-        voltage = int.from_bytes(self._exchange(0x24, length=5)[2:4], "big") / 1000
-        current = int.from_bytes(self._exchange(0x27, length=5)[2:4], "big") / 1000
+        voltage, current = self._state.bus_voltage_v, self._state.phase_current_a
+        # Position/status/trajectory are critical. Electrical telemetry does not
+        # delay every command and is skipped when an operator command is queued.
+        if telemetry and self._commands.empty() and (voltage is None or now-self._last_telemetry >= 2):
+            voltage = int.from_bytes(self._exchange(0x24, length=5)[2:4], "big") / 1000
+            if self._commands.empty():
+                current = int.from_bytes(self._exchange(0x27, length=5)[2:4], "big") / 1000
+                self._last_telemetry = time.monotonic()
         self._state = replace(self._state, connected=True, enabled=bool(status & 1), position_deg=actual,
                               speed_rpm=speed, motion=self._motion if self._commands.empty() else "pending", bus_voltage_v=voltage,
                               phase_current_a=current, remaining_s=max(0, self._deadline-now)

@@ -13,3 +13,8 @@ trap 'rm -f "$test_binary"' EXIT
 "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
     -Itests/stubs -ICore/BSP tests/test_keys.c -o "$test_binary"
 "$test_binary"
+
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -Itests/stubs -ICore/BSP tests/test_bridge.c Core/BSP/motor_bridge.c \
+    Core/BSP/emm_v5.c -o "$test_binary"
+"$test_binary"

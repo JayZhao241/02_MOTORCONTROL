@@ -1,0 +1,31 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "运行项目：固件 + 桌面端",
+            "type": "node-terminal",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "command": "python3 \"${workspaceFolder}/run.py\"",
+            "osx": {
+                "command": "/bin/zsh \"${workspaceFolder}/desktop/启动电机控制台.command\" --run-project"
+            },
+            "windows": {
+                "command": "py -3 \"${workspaceFolder}/run.py\""
+            }
+        },
+        {
+            "name": "运行桌面端：模拟",
+            "type": "node-terminal",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "command": "python3 \"${workspaceFolder}/run.py\" --simulate",
+            "osx": {
+                "command": "/bin/zsh \"${workspaceFolder}/desktop/启动电机控制台.command\" --run-project --simulate"
+            },
+            "windows": {
+                "command": "py -3 \"${workspaceFolder}/run.py\" --simulate"
+            }
+        }
+    ]
+}

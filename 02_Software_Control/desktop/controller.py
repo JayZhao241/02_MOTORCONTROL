@@ -38,15 +38,11 @@ class Snapshot:
     origin: str
     bus_voltage_v: float | None = None
     phase_current_a: float | None = None
+    error: str | None = None
 
 
 class MotorBackend(Protocol):
-    """All angles are signed multi-turn degrees. Implementations own I/O and feedback.
-
-    Future hardware adapters must derive angle/pulse mapping from the actual motor,
-    expose unconfirmed/stale feedback, and implement a device-side run watchdog.
-    No raw Emm forwarding is mixed into the existing motor_app transaction owner.
-    """
+    """Signed multi-turn degree commands and device feedback."""
 
     def connect(self) -> None: ...
     def disconnect(self) -> None: ...
@@ -55,6 +51,7 @@ class MotorBackend(Protocol):
     def rotate(self, direction: int, rpm: float, duration: float) -> None: ...
     def stop(self) -> None: ...
     def set_origin(self) -> None: ...
+    def save_startup_origin(self) -> None: ...
     def update(self, seconds: float) -> None: ...
     def snapshot(self) -> Snapshot: ...
 
@@ -70,7 +67,7 @@ class DemoBackend:
         self.rpm = 0.0
         self.remaining: float | None = None
         self.direction = 1
-        self.origin = "演示初始零点"
+        self.origin = "模拟零点"
 
     def connect(self) -> None:
         self.connected = True
@@ -84,7 +81,7 @@ class DemoBackend:
 
     def enable(self, enabled: bool) -> None:
         if not self.connected:
-            raise ValueError("请先连接演示设备")
+            raise ValueError("请先连接设备")
         if not enabled:
             self.stop()
         self.enabled = enabled
@@ -104,7 +101,11 @@ class DemoBackend:
 
     def set_origin(self) -> None:
         self.position = 0.0
-        self.origin = "用户设置的坐标零点（演示）"
+        self.origin = "用户坐标"
+
+    def save_startup_origin(self) -> None:
+        self.set_origin()
+        self.origin = "模拟开机零点"
 
     def update(self, seconds: float) -> None:
         if not self.connected or not self.enabled or self.rpm == 0:
@@ -138,21 +139,28 @@ class Controller:
         self.mode = "position"
         self.armed: tuple[int, float, float] | None = None
 
+    def select_backend(self, backend: MotorBackend) -> None:
+        state = self.backend.snapshot()
+        if state.connected or state.motion != "idle":
+            raise ValueError("请先断开连接")
+        self.armed = None
+        self.backend = backend
+
     def _ready(self) -> Snapshot:
         state = self.backend.snapshot()
         if not state.connected:
-            raise ValueError("请先连接演示设备")
+            raise ValueError("请先连接设备")
         if not state.enabled:
             raise ValueError("请先使能电机")
         if state.motion != "idle":
-            raise ValueError("电机正在运行，请先停止；重复指令不会排队")
+            raise ValueError("电机忙，请先停止")
         return state
 
     @staticmethod
     def _rpm(value: object) -> float:
         rpm = number(value, "转速 RPM", 1, 3000)
         if not rpm.is_integer():
-            raise ValueError("转速 RPM 请输入整数，与当前固件参数一致")
+            raise ValueError("转速 RPM 请输入整数")
         return rpm
 
     @staticmethod
@@ -205,6 +213,13 @@ class Controller:
             raise ValueError("仅在已连接且电机停止时可以设置零点")
         self.armed = None
         self.backend.set_origin()
+
+    def save_startup_origin(self) -> None:
+        state = self.backend.snapshot()
+        if not state.connected or state.motion != "idle":
+            raise ValueError("请在已连接且电机停止时保存开机零点")
+        self.armed = None
+        self.backend.save_startup_origin()
 
     def arm(self, direction: int, rpm: object, duration: object) -> None:
         self.armed = None

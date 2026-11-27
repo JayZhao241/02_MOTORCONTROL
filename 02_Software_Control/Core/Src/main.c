@@ -62,7 +62,8 @@ static volatile RS485_Result_t s_dbg_comm_result = RS485_OK;
 /* Explicit Watch requests: 1 version, 2 status, 3 options, 4 position,
  * 5 recover, 6 move (arm required), 7 voltage, 8 current, 9 target,
  * 10 stop, 11 enable, 12 disable, 13 health, 14 Emm PID, 15 Emm config,
- * 16 integral limit, 17 trajectory position, 18 position error.
+ * 16 integral limit, 17 trajectory position, 18 position error,
+ * 19 homing parameters, 20 save current origin and power-on homing (HOME arm).
  * Nothing is sent on startup. */
 static volatile struct {
     uint32_t request;
@@ -92,7 +93,10 @@ static void Requests_Proc(void)
 {
     uint8_t keys = KEY_TakePress();
     uint32_t request = s_debug.request;
-    s_debug.request = 0U;
+    /* SWD can publish a request between this read and the clear. Never clear
+     * an empty mailbox: that would discard a newly published host request.
+     * The host waits for acceptance before publishing its next request. */
+    if (request != 0U) { s_debug.request = 0U; }
     if (keys != 0U) { s_debug.last_key = keys; }
     if (keys & KEY_EVENT_K0) {
         MOTOR_AppDebug_t app;
@@ -129,6 +133,12 @@ static void Requests_Proc(void)
         case 16: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x23U); break;
         case 17: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x34U); break;
         case 18: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x37U); break;
+        case 19: s_debug.result = MOTOR_AppQuery(s_debug.address, 0x22U); break;
+        case 20: {
+            uint32_t arm=s_debug.arm; s_debug.arm=0U;
+            s_debug.result=arm == 0x484F4D45U ? MOTOR_AppSaveStartupOrigin(s_debug.address) : RS485_NOT_READY;
+            break;
+        }
         default: s_debug.result = RS485_INVALID_PARAM; break;
         }
         return;

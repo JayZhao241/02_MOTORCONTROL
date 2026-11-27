@@ -7,7 +7,9 @@ typedef enum {
     MOTOR_APP_ENABLE, MOTOR_APP_STATUS, MOTOR_APP_BASELINE,
     MOTOR_APP_MOVE_ACK, MOTOR_APP_MONITOR, MOTOR_APP_QUERY,
     MOTOR_APP_STOPPING, MOTOR_APP_ENABLE_ONLY, MOTOR_APP_DISABLE_ONLY,
-    MOTOR_APP_DONE, MOTOR_APP_STOP_ACCEPTED, MOTOR_APP_FAILED
+    MOTOR_APP_DONE, MOTOR_APP_STOP_ACCEPTED, MOTOR_APP_FAILED,
+    MOTOR_APP_HOME_OPTIONS, MOTOR_APP_HOME_READ, MOTOR_APP_HOME_SAVE,
+    MOTOR_APP_HOME_CLEAR, MOTOR_APP_HOME_WRITE, MOTOR_APP_HOME_VERIFY
 } MOTOR_AppStage_t;
 typedef enum {
     MOTOR_APP_NO_ERROR = 0, MOTOR_APP_BAD_OPTIONS, MOTOR_APP_DISABLED,
@@ -37,5 +39,6 @@ RS485_Result_t MOTOR_AppStop(uint8_t address);
 /* Operator confirms previous motor action is stopped and old session is clean.
  * Does not automatically restart DMA, enable, recalibrate, or retry motion. */
 RS485_Result_t MOTOR_AppRecover(void);
+RS485_Result_t MOTOR_AppSaveStartupOrigin(uint8_t address);
 bool MOTOR_AppGetDebug(MOTOR_AppDebug_t *out);
 #endif

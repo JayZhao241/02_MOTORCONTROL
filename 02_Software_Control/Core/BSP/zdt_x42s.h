@@ -90,6 +90,12 @@ typedef struct {
     int64_t position_error; /* 37: signed Emm angle units, same scale as position. */
     double position_deg, position_error_deg;
     bool position_error_valid;
+    struct {
+        bool valid;
+        uint8_t raw[15], mode, power_on;
+        uint16_t speed_rpm;
+        uint32_t timeout_ms;
+    } home;
 } ZDT_Debug_t;
 
 /* All APIs run in the main loop; only this module calls RS485_Read. No broadcast. */
@@ -127,6 +133,7 @@ RS485_Result_t ZDT_X42S_StartQuery(uint8_t address, uint8_t function);
  * Discards published software bytes; cannot identify/eliminate future late data.
  * Invalidates all cached data and motion evidence. Never sends a motor command. */
 RS485_Result_t ZDT_X42S_ResumeAfterTimeout(void);
+RS485_Result_t ZDT_X42S_WriteHome(uint8_t address, uint8_t function, const uint8_t *parameters);
 void ZDT_X42S_Proc(void);
 bool ZDT_X42S_GetDebug(ZDT_Debug_t *out);
 /* Main-loop read-only view; no copy in the per-iteration application scheduler.

@@ -1,16 +1,39 @@
 {
-	"version": "2.0.0",
-	"tasks": [
-		{
-			"label": "运行电机控制台（演示）",
-			"type": "shell",
-			"command": "python",
-			"args": [
-				"-m",
-				"desktop.app"
-			],
-			"isBackground": true,
-			"problemMatcher": []
-		}
-	]
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "运行项目：固件 + 桌面端",
+            "type": "process",
+            "command": "python3",
+            "args": ["${workspaceFolder}/run.py"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "osx": {
+                "command": "/bin/zsh",
+                "args": ["${workspaceFolder}/desktop/启动电机控制台.command", "--run-project"]
+            },
+            "windows": {
+                "command": "py",
+                "args": ["-3", "${workspaceFolder}/run.py"]
+            },
+            "problemMatcher": ["$gcc"],
+            "presentation": {"reveal": "always", "panel": "dedicated"}
+        },
+        {
+            "label": "运行桌面端：模拟",
+            "type": "process",
+            "command": "python3",
+            "args": ["${workspaceFolder}/run.py", "--simulate"],
+            "options": {"cwd": "${workspaceFolder}"},
+            "osx": {
+                "command": "/bin/zsh",
+                "args": ["${workspaceFolder}/desktop/启动电机控制台.command", "--run-project", "--simulate"]
+            },
+            "windows": {
+                "command": "py",
+                "args": ["-3", "${workspaceFolder}/run.py", "--simulate"]
+            },
+            "problemMatcher": [],
+            "presentation": {"reveal": "silent", "panel": "dedicated"}
+        }
+    ]
 }

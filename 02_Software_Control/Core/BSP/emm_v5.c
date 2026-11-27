@@ -1,5 +1,6 @@
 #include "emm_v5.h"
 #include <stddef.h>
+#include <string.h>
 
 bool EMM_V5_BuildPosition(const EMM_V5_Position_t *m, uint8_t *out, uint16_t capacity)
 {
@@ -28,10 +29,33 @@ bool EMM_V5_BuildStop(uint8_t address, uint8_t *out, uint16_t capacity)
     out[0] = address; out[1] = 0xFEU; out[2] = 0x98U; out[3] = 0U; out[4] = 0x6BU;
     return true;
 }
+bool EMM_V5_BuildHomeWrite(uint8_t address, uint8_t function, const uint8_t *p,
+                           uint8_t *out, uint16_t capacity)
+{
+    if (!address || !out) { return false; }
+    if (function == 0x93U && capacity >= 5U) {
+        const uint8_t frame[] = {address, 0x93U, 0x88U, 1U, 0x6BU};
+        memcpy(out, frame, sizeof(frame)); return true;
+    }
+    if (function == 0x0AU && capacity >= 4U) {
+        const uint8_t frame[] = {address, 0x0AU, 0x6DU, 0x6BU};
+        memcpy(out, frame, sizeof(frame)); return true;
+    }
+    if (function == 0x4CU && p && capacity >= 20U && p[0] == 0U && p[14] == 1U) {
+        out[0]=address; out[1]=0x4CU; out[2]=0xAEU; out[3]=1U;
+        memcpy(out+4, p, 15U); out[19]=0x6BU; return true;
+    }
+    return false;
+}
+bool EMM_V5_IsAckFunction(uint8_t function)
+{ return function == 0xF3U || function == 0xFDU || function == 0xFEU ||
+         function == 0x93U || function == 0x4CU || function == 0x0AU; }
 uint8_t EMM_V5_ReplyLength(uint8_t function)
 {
     switch (function) {
     case 0x1F: return 7U;
+    case 0x22: return 18U;
+    case 0x93: case 0x4C: case 0x0A: return 4U;
     case 0x21: return 15U; /* Emm PID; X firmware has a different layout. */
     case 0x23: return 7U;
     case 0x42: return 33U; /* Emm driver configuration. */
@@ -43,7 +67,7 @@ uint8_t EMM_V5_ReplyLength(uint8_t function)
 }
 bool EMM_V5_BuildRead(uint8_t address, uint8_t function, uint8_t *out, uint16_t capacity)
 {
-    if (!address || !out || capacity < 3U || function >= 0xF0U ||
+    if (!address || !out || capacity < 3U || EMM_V5_IsAckFunction(function) ||
         EMM_V5_ReplyLength(function) == 0U) { return false; }
     if (function == 0x42U) {
         if (capacity < 4U) { return false; }

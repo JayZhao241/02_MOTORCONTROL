@@ -376,6 +376,30 @@ int main(void)
     assert(!protocol().position_valid && !protocol().position_error_valid);
     assert(MOTOR_AppRecover()==RS485_OK);
 
+    /* Persist the physical origin once, preserving unrelated homing limits. */
+    assert(MOTOR_AppSaveStartupOrigin(1)==RS485_OK);
+    pump(10); assert(tx[1]==0x1A); reply(options,5);
+    pump(10); assert(tx[1]==0x22 && tx_len==3);
+    uint8_t home_reply[]={1,0x22,1,1,0,30,0,0,0x27,0x10,1,0x2C,3,0x20,0,60,0,0x6B};
+    reply(home_reply,sizeof(home_reply));
+    pump(10); const uint8_t save_origin[]={1,0x93,0x88,1,0x6B};
+    assert(tx_len==5 && !memcmp(tx,save_origin,5));
+    const uint8_t origin_ack[]={1,0x93,2,0x6B}; reply(origin_ack,4);
+    pump(249); assert(tx[1]==0x93);
+    pump(1); const uint8_t clear_origin[]={1,0x0A,0x6D,0x6B};
+    assert(tx_len==4 && !memcmp(tx,clear_origin,4));
+    const uint8_t clear_ack[]={1,0x0A,2,0x6B}; reply(clear_ack,4);
+    pump(10); assert(tx_len==20 && tx[1]==0x4C && tx[2]==0xAE && tx[3]==1);
+    assert(tx[4]==0 && tx[5]==1 && tx[6]==0 && tx[7]==5 && tx[18]==1 && tx[19]==0x6B);
+    assert(!memcmp(tx+8,home_reply+6,10));
+    const uint8_t home_ack[]={1,0x4C,2,0x6B}; reply(home_ack,4);
+    pump(249); assert(tx[1]==0x4C);
+    pump(1); assert(tx[1]==0x22);
+    home_reply[2]=0; home_reply[5]=5; home_reply[16]=1;
+    reply(home_reply,sizeof(home_reply));
+    assert(application().stage==MOTOR_APP_DONE && protocol().home.valid);
+    assert(protocol().home.power_on==1 && protocol().home.speed_rpm==5);
+
     /* Response deadline handles tick wrap, fault latch survives late TC. */
     tick=UINT32_MAX-49U;
     assert(ZDT_X42S_StartVersionQuery(1)==RS485_OK); HAL_UART_TxCpltCallback(&huart2);

@@ -7,6 +7,7 @@
 #define MOTOR_FRAME_GAP_MS 10U
 #define MOTOR_SEND_WAIT_MS 500U
 static MOTOR_AppDebug_t s_app;
+static uint8_t home_parameters[15];
 static uint32_t boot_tick, stage_tick, last_step_tick;
 
 static bool Active(void)
@@ -90,6 +91,12 @@ RS485_Result_t MOTOR_AppEnable(uint8_t address, bool enable)
     if (result == RS485_OK) { Start(address, enable ? MOTOR_APP_ENABLE_ONLY : MOTOR_APP_DISABLE_ONLY); }
     return RecordRequest(result);
 }
+RS485_Result_t MOTOR_AppSaveStartupOrigin(uint8_t address)
+{
+    RS485_Result_t result=Available(address);
+    if (result == RS485_OK) { Start(address, MOTOR_APP_HOME_OPTIONS); }
+    return RecordRequest(result);
+}
 RS485_Result_t MOTOR_AppStop(uint8_t address)
 {
     if (!address) { return RecordRequest(RS485_INVALID_PARAM); }
@@ -115,6 +122,12 @@ RS485_Result_t MOTOR_AppRecover(void)
 static RS485_Result_t SendStage(void)
 {
     switch (s_app.stage) {
+    case MOTOR_APP_HOME_OPTIONS: return ZDT_X42S_StartOptionsQuery(s_app.address);
+    case MOTOR_APP_HOME_READ: case MOTOR_APP_HOME_VERIFY:
+        return ZDT_X42S_StartQuery(s_app.address, 0x22U);
+    case MOTOR_APP_HOME_SAVE: return ZDT_X42S_WriteHome(s_app.address, 0x93U, NULL);
+    case MOTOR_APP_HOME_CLEAR: return ZDT_X42S_WriteHome(s_app.address, 0x0AU, NULL);
+    case MOTOR_APP_HOME_WRITE: return ZDT_X42S_WriteHome(s_app.address, 0x4CU, home_parameters);
     case MOTOR_APP_OPTIONS: return ZDT_X42S_StartOptionsQuery(s_app.address);
     case MOTOR_APP_ENABLE: case MOTOR_APP_ENABLE_ONLY: return ZDT_X42S_StartEnable(s_app.address, true);
     case MOTOR_APP_DISABLE_ONLY: return ZDT_X42S_StartEnable(s_app.address, false);
@@ -147,7 +160,9 @@ void MOTOR_AppProc(void)
         return;
     }
     if (!s_app.waiting_for_reply) {
-        if ((uint32_t)(now - last_step_tick) < MOTOR_FRAME_GAP_MS) { return; }
+        /* NVM save acknowledgements can precede the driver's flash commit. */
+        uint32_t gap=(s_app.stage == MOTOR_APP_HOME_CLEAR || s_app.stage == MOTOR_APP_HOME_VERIFY) ? 250U : MOTOR_FRAME_GAP_MS;
+        if ((uint32_t)(now - last_step_tick) < gap) { return; }
         RS485_Result_t result = SendStage();
         if (result == RS485_BUSY) {
             if ((uint32_t)(now - stage_tick) >= MOTOR_SEND_WAIT_MS) { Fail(RS485_TIMEOUT, MOTOR_APP_IO_FAILURE); }
@@ -183,6 +198,26 @@ void MOTOR_AppProc(void)
     case MOTOR_APP_MOVE_ACK:
         if (!p->command_accepted) { Fail(RS485_NOT_READY, MOTOR_APP_REPLY_REJECTED); }
         else { Stage(p->motion == ZDT_MOTION_ARRIVED ? MOTOR_APP_DONE : MOTOR_APP_MONITOR); }
+        break;
+    case MOTOR_APP_HOME_OPTIONS:
+        if (!p->options_valid || (p->options & 0x86U) != 6U) { Fail(RS485_NOT_READY, MOTOR_APP_BAD_OPTIONS); }
+        else { Stage(MOTOR_APP_HOME_READ); }
+        break;
+    case MOTOR_APP_HOME_READ:
+        if (!p->home.valid) { Fail(RS485_NOT_READY, MOTOR_APP_IO_FAILURE); break; }
+        memcpy(home_parameters, p->home.raw, sizeof(home_parameters));
+        home_parameters[0]=0U; /* Nearest single-turn origin. */
+        home_parameters[2]=0U; home_parameters[3]=5U; /* 5 RPM */
+        home_parameters[4]=0U; home_parameters[5]=0U; home_parameters[6]=0x27U; home_parameters[7]=0x10U;
+        home_parameters[14]=1U; /* Driver stores power-on homing. */
+        Stage(MOTOR_APP_HOME_SAVE); break;
+    case MOTOR_APP_HOME_SAVE: Stage(MOTOR_APP_HOME_CLEAR); break;
+    case MOTOR_APP_HOME_CLEAR: Stage(MOTOR_APP_HOME_WRITE); break;
+    case MOTOR_APP_HOME_WRITE: Stage(MOTOR_APP_HOME_VERIFY); break;
+    case MOTOR_APP_HOME_VERIFY:
+        if (!p->home.valid || memcmp(p->home.raw, home_parameters, sizeof(home_parameters))) {
+            Fail(RS485_NOT_READY, MOTOR_APP_IO_FAILURE);
+        } else { Stage(MOTOR_APP_DONE); }
         break;
     case MOTOR_APP_STOPPING: Stage(MOTOR_APP_STOP_ACCEPTED); break;
     default: Stage(MOTOR_APP_DONE); break;

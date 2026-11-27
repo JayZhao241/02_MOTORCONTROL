@@ -58,6 +58,7 @@ static void SelectAddress(uint8_t address)
         s_query.integral_limit_valid = false;
         s_query.setpoint_valid = false;
         s_query.position_error_valid = false;
+        s_query.home.valid = false;
         s_query.arrived = s_query.command_accepted = s_query.started_observed = false;
         s_query.state = ZDT_VERSION_IDLE;
     }
@@ -99,6 +100,7 @@ static RS485_Result_t Begin(const uint8_t *cmd, uint16_t len)
     else if (s_query.function == 0x21U) { s_query.pid.valid = false; }
     else if (s_query.function == 0x42U) { s_query.config.valid = false; }
     else if (s_query.function == 0x23U) { s_query.integral_limit_valid = false; }
+    if (s_query.function == 0x22U) { s_query.home.valid = false; }
     return StartResult(r);
 }
 RS485_Result_t ZDT_X42S_StartQuery(uint8_t addr, uint8_t fn)
@@ -110,6 +112,14 @@ RS485_Result_t ZDT_X42S_StartQuery(uint8_t addr, uint8_t fn)
         return StartResult(RS485_NOT_READY);
     }
     return Begin(cmd, fn == 0x42U ? 4U : 3U);
+}
+RS485_Result_t ZDT_X42S_WriteHome(uint8_t address, uint8_t function, const uint8_t *parameters)
+{
+    uint8_t frame[20];
+    if (!EMM_V5_BuildHomeWrite(address, function, parameters, frame, sizeof(frame))) {
+        return StartResult(RS485_INVALID_PARAM);
+    }
+    return Begin(frame, function == 0x4CU ? 20U : function == 0x93U ? 5U : 4U);
 }
 #define Query ZDT_X42S_StartQuery
 RS485_Result_t ZDT_X42S_StartVersionQuery(uint8_t addr) { return Query(addr, 0x1FU); }
@@ -123,7 +133,7 @@ RS485_Result_t ZDT_X42S_StartTargetQuery(uint8_t addr) { return Query(addr, 0x33
 
 RS485_Result_t ZDT_X42S_StartEmmMove(const ZDT_EmmMove_t *m)
 {
-    uint8_t cmd[EMM_V5_MAX_FRAME];
+    uint8_t cmd[13];
     if (!EMM_V5_BuildPosition(m, cmd, sizeof(cmd))) {
         return MoveResult(RS485_INVALID_PARAM, ZDT_MOVE_INVALID_PARAM);
     }
@@ -298,6 +308,11 @@ static void AcceptFrame(const uint8_t *f, uint8_t n)
         c->max_output_raw = ReadU16(f + 16);
         c->arrival_window_tenths_deg = ReadU16(f + 30);
         c->valid = true;
+    } else if (f[1] == 0x22U) {
+        memcpy(s_query.home.raw, f+2, 15U);
+        s_query.home.mode=f[2]; s_query.home.speed_rpm=ReadU16(f+4);
+        s_query.home.timeout_ms=ReadU32(f+6); s_query.home.power_on=f[16];
+        s_query.home.valid = f[2] <= 3U && f[3] <= 1U && f[16] <= 1U;
     } else if (f[1] == 0x1AU) {
         /* Actual motor reply: Addr 1A OptionsH OptionsL 6B (five bytes).
          * The manual's one-byte diagram omits the documented bits8/9. */
@@ -374,7 +389,7 @@ static void Feed(uint8_t byte)
         uint8_t len = EMM_V5_ReplyLength(f[1]);
         bool invalid = !f[0] || len == 0U;
         if (!invalid && used >= 3U) {
-            invalid = (f[1] >= 0xF0U && !EMM_V5_IsAckStatus(f[2])) ||
+            invalid = (EMM_V5_IsAckFunction(f[1]) && !EMM_V5_IsAckStatus(f[2])) ||
                       ((f[1] == 0x36U || f[1] == 0x33U || f[1] == 0x34U || f[1] == 0x37U) && f[2] > 1U);
             if (f[1] == 0x42U && f[2] != 33U) { invalid = true; }
         }
@@ -393,7 +408,8 @@ static void Feed(uint8_t byte)
 void ZDT_X42S_Proc(void)
 {
     uint32_t now = HAL_GetTick();
-    if (s_query.transaction == ZDT_TXN_WAIT && now - txn_tick >= RESPONSE_MS) {
+    if (s_query.transaction == ZDT_TXN_WAIT && now - txn_tick >=
+        ((s_query.function == 0x93U || s_query.function == 0x4CU) ? 1000U : RESPONSE_MS)) {
         Fail(RS485_TIMEOUT);
     }
     /* Only this location reads RX, including idle/late notifications. */
